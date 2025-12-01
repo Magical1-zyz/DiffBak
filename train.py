@@ -11,7 +11,7 @@ import xatlas
 from dataset.dataset_mesh import DatasetMesh
 from geometry.dlmesh import DLMesh
 from render import obj, gltf, material, util, mesh, texture, light, render
-from render.renderutils.loss import BakingLoss  # 引用我们刚写好的 Loss 类
+from render.renderutils.loss import BakingLoss
 
 
 # ----------------------------------------------------------------------------
@@ -114,8 +114,9 @@ def main():
 
     # [Input/Output]
     parser.add_argument('--config', type=str, default=None, help='Config JSON file')
-    parser.add_argument('-rm', '--ref_mesh', type=str, required=True, help='High-poly reference')
-    parser.add_argument('-bm', '--base_mesh', type=str, required=True, help='Low-poly target')
+    # 修改：移除了 required=True，以便支持从 config 文件读取
+    parser.add_argument('-rm', '--ref_mesh', type=str, default=None, help='High-poly reference')
+    parser.add_argument('-bm', '--base_mesh', type=str, default=None, help='Low-poly target')
     parser.add_argument('-o', '--out-dir', type=str, default='out/baking_result')
 
     # [Baking Options]
@@ -131,7 +132,7 @@ def main():
                         help='Rendering resolution during training')
     parser.add_argument('--spp', type=int, default=2, help='Samples per pixel (Anti-aliasing)')
 
-    # [Loss Control] - 暴露给用户的参数
+    # [Loss Control]
     parser.add_argument('--loss_type', type=str, default='logl1', choices=['l1', 'logl1', 'mse'],
                         help='Main reconstruction loss type')
     parser.add_argument('--smooth_weight', type=float, default=0.02,
@@ -143,13 +144,30 @@ def main():
     parser.add_argument('--cam_radius_scale', type=float, default=2.0)
     parser.add_argument('--background_rgb', nargs=3, type=float, default=[0.0, 0.0, 0.0])
     parser.add_argument('--display_interval', type=int, default=50)
+    parser.add_argument('--save_interval', type=int, default=100)
 
     FLAGS = parser.parse_args()
 
+    # 1. 加载 Config 覆盖参数
     if FLAGS.config is not None:
+        if not os.path.exists(FLAGS.config):
+            raise FileNotFoundError(f"Config file not found: {FLAGS.config}")
         data = json.load(open(FLAGS.config, 'r'))
         for key in data:
-            FLAGS.__dict__[key] = data[key]
+            if hasattr(FLAGS, key):
+                # 仅覆盖存在的参数，或者在这里做类型检查
+                val = data[key]
+                # 特殊处理 list 类型参数，确保转换正确
+                if isinstance(val, list) and not isinstance(getattr(FLAGS, key), list):
+                    # 如果原参数不是list但config里是list（这通常不应该发生，除非是位置参数）
+                    pass
+                FLAGS.__dict__[key] = val
+
+    # 2. 手动检查必需参数
+    if FLAGS.ref_mesh is None:
+        raise ValueError("Reference mesh (-rm/--ref_mesh) is required (either in CLI or Config).")
+    if FLAGS.base_mesh is None:
+        raise ValueError("Base mesh (-bm/--base_mesh) is required (either in CLI or Config).")
 
     print(f"\n=== Texture Baking Config ===")
     print(f" Ref: {FLAGS.ref_mesh}")
@@ -157,6 +175,7 @@ def main():
     print(f" Output: {FLAGS.out_dir}")
     print(f" Loss: {FLAGS.loss_type} (Smooth: {FLAGS.smooth_weight})")
     print(f" Multi-Mat: {FLAGS.multi_materials}")
+    print(f" Texture Res: {FLAGS.texture_res}")
     print(f"=============================\n")
 
     os.makedirs(FLAGS.out_dir, exist_ok=True)
@@ -237,14 +256,12 @@ def main():
     optimizer = torch.optim.Adam(params, lr=FLAGS.lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda x: max(0.0, 10 ** (-x * 0.0002)))
 
-    # 使用我们封装好的 Loss Manager
     criterion = BakingLoss(loss_type=FLAGS.loss_type, smooth_weight=FLAGS.smooth_weight)
 
     # 5. Training Loop
     print(f"[4/5] Baking...")
     start_t = time.time()
 
-    # Simple random batch generator
     def get_batch(n, b):
         while True:
             perm = np.random.permutation(n)
@@ -276,6 +293,13 @@ def main():
         with torch.no_grad():
             for m in train_mats: m['kd'].clamp_()
 
+        if FLAGS.save_interval and it % FLAGS.save_interval == 0:
+            with torch.no_grad():
+                for i, m in enumerate(train_mats):
+                    suffix = f"_mat{i}" if len(train_mats) > 1 else ""
+                    filename = os.path.join(FLAGS.out_dir, f"progress_kd{suffix}_{it:04d}.png")
+                    texture.save_texture2D(filename, texture.rgb_to_srgb(m['kd']))
+
         if it % 50 == 0:
             print(f"      Iter {it:04d} | Loss: {loss.item():.6f} (Main: {stats['main']:.6f}, Reg: {stats['reg']:.6f})")
 
@@ -290,12 +314,41 @@ def main():
 
     # 6. Final Export
     print(f"\n[5/5] Exporting...")
-    save_path = os.path.join(FLAGS.out_dir, "baked_mesh")
 
-    if len(train_mats) > 1:
-        gltf.save_gltf_multi(save_path, geometry.mesh, diffuse_only=True)
+    # PSNR Check
+    total_psnr = 0.0
+    count = 0
+    final_mesh = geometry.getMesh(None)  # Recalculate tangents if needed, though geometry is static here
+    # Assign correct material structure back to final mesh just in case
+    if len(train_mats) == 1 and not FLAGS.multi_materials:
+        final_mesh.material = train_mats[0]
+        final_mesh.materials = None
     else:
-        gltf.save_gltf(save_path, geometry.mesh, diffuse_only=True)
+        final_mesh.materials = train_mats
+
+    with torch.no_grad():
+        for i, view in enumerate(views):
+            buffers = render.render_mesh(glctx, final_mesh, view['mvp'], view['campos'], lgt, FLAGS.train_res,
+                                         spp=FLAGS.spp, msaa=True, bsdf='kd')
+            opt_rgb = torch.clamp(buffers['shaded'][..., 0:3], 0.0, 1.0)
+            ref_rgb = torch.clamp(target_images[i][..., 0:3], 0.0, 1.0)
+            mask = target_images[i][..., 3:4] > 0.0
+
+            valid = torch.sum(mask) * 3.0
+            if valid < 1.0: continue
+            mse = torch.sum(((opt_rgb - ref_rgb) * mask) ** 2) / valid
+            psnr = -10.0 * torch.log10(mse + 1e-8)
+            total_psnr += psnr.item()
+            count += 1
+
+    avg_psnr = total_psnr / count if count > 0 else 0.0
+    print(f"      Final Average PSNR: {avg_psnr:.2f} dB")
+
+    save_path = os.path.join(FLAGS.out_dir, "baked_mesh")
+    if len(train_mats) > 1:
+        gltf.save_gltf_multi(save_path, final_mesh, diffuse_only=True)
+    else:
+        gltf.save_gltf(save_path, final_mesh, diffuse_only=True)
 
     print(f"Saved to {save_path}")
     print("[Done]")
