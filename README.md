@@ -68,7 +68,6 @@ python train_bake.py --config configs/my_bake_config.json
 ```text
 DiffBake/
 ├── configs/                # 配置文件目录
-│   └── my_bake_config.json # 示例配置文件
 ├── data/                   # 存放输入模型 (.gltf/.obj) 和环境贴图 (.hdr)
 ├── dataset/                # 数据加载模块
 │   ├── dataset.py          # 数据集基类
