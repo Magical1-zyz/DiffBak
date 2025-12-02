@@ -29,82 +29,53 @@ class Mesh:
         self.t_nrm_idx = t_nrm_idx
         self.t_tex_idx = t_tex_idx
         self.t_tng_idx = t_tng_idx
-        # Single-material (legacy)
         self.material = material
-        # Multi-material support
-        self.materials = materials  # optional: list of materials
-        self.face_material_idx = face_material_idx  # optional: LongTensor [num_faces]
+        self.materials = materials
+        self.face_material_idx = face_material_idx
 
         if base is not None:
             self.copy_none(base)
 
     def copy_none(self, other):
-        if self.v_pos is None:
-            self.v_pos = other.v_pos
-        if self.t_pos_idx is None:
-            self.t_pos_idx = other.t_pos_idx
-        if self.v_nrm is None:
-            self.v_nrm = other.v_nrm
-        if self.t_nrm_idx is None:
-            self.t_nrm_idx = other.t_nrm_idx
-        if self.v_tex is None:
-            self.v_tex = other.v_tex
-        if self.t_tex_idx is None:
-            self.t_tex_idx = other.t_tex_idx
-        if self.v_tng is None:
-            self.v_tng = other.v_tng
-        if self.t_tng_idx is None:
-            self.t_tng_idx = other.t_tng_idx
-        if self.material is None:
-            self.material = other.material
-        # Preserve multi-material fields if not set
-        if self.materials is None and hasattr(other, 'materials'):
-            self.materials = other.materials
-        if self.face_material_idx is None and hasattr(other, 'face_material_idx'):
-            self.face_material_idx = other.face_material_idx
+        if self.v_pos is None: self.v_pos = other.v_pos
+        if self.t_pos_idx is None: self.t_pos_idx = other.t_pos_idx
+        if self.v_nrm is None: self.v_nrm = other.v_nrm
+        if self.t_nrm_idx is None: self.t_nrm_idx = other.t_nrm_idx
+        if self.v_tex is None: self.v_tex = other.v_tex
+        if self.t_tex_idx is None: self.t_tex_idx = other.t_tex_idx
+        if self.v_tng is None: self.v_tng = other.v_tng
+        if self.t_tng_idx is None: self.t_tng_idx = other.t_tng_idx
+        if self.material is None: self.material = other.material
+        if self.materials is None and hasattr(other, 'materials'): self.materials = other.materials
+        if self.face_material_idx is None and hasattr(other,
+                                                      'face_material_idx'): self.face_material_idx = other.face_material_idx
 
     def clone(self):
         out = Mesh(base=self)
-        if out.v_pos is not None:
-            out.v_pos = out.v_pos.clone().detach()
-        if out.t_pos_idx is not None:
-            out.t_pos_idx = out.t_pos_idx.clone().detach()
-        if out.v_nrm is not None:
-            out.v_nrm = out.v_nrm.clone().detach()
-        if out.t_nrm_idx is not None:
-            out.t_nrm_idx = out.t_nrm_idx.clone().detach()
-        if out.v_tex is not None:
-            out.v_tex = out.v_tex.clone().detach()
-        if out.t_tex_idx is not None:
-            out.t_tex_idx = out.t_tex_idx.clone().detach()
-        if out.v_tng is not None:
-            out.v_tng = out.v_tng.clone().detach()
-        if out.t_tng_idx is not None:
-            out.t_tng_idx = out.t_tng_idx.clone().detach()
-        # For multi-material indices, clone tensor
+        if out.v_pos is not None: out.v_pos = out.v_pos.clone().detach()
+        if out.t_pos_idx is not None: out.t_pos_idx = out.t_pos_idx.clone().detach()
+        if out.v_nrm is not None: out.v_nrm = out.v_nrm.clone().detach()
+        if out.t_nrm_idx is not None: out.t_nrm_idx = out.t_nrm_idx.clone().detach()
+        if out.v_tex is not None: out.v_tex = out.v_tex.clone().detach()
+        if out.t_tex_idx is not None: out.t_tex_idx = out.t_tex_idx.clone().detach()
+        if out.v_tng is not None: out.v_tng = out.v_tng.clone().detach()
+        if out.t_tng_idx is not None: out.t_tng_idx = out.t_tng_idx.clone().detach()
         if out.face_material_idx is not None and torch.is_tensor(out.face_material_idx):
             out.face_material_idx = out.face_material_idx.clone().detach()
-        # 'materials' is a list of modules; keep reference (do not deep copy here)
         return out
 
 
 ######################################################################################
-# Mesh loeading helper
+# Mesh loading helper (智能格式路由)
 ######################################################################################
 
 def load_mesh(filename, mtl_override=None):
     name, ext = os.path.splitext(filename)
-    ext = ext.lower()  # 统一转小写，防止 .OBJ 识别失败
-
+    ext = ext.lower()
     if ext == ".obj":
-        # OBJ 走 obj.py，支持 MTL 材质解析
         return obj.load_obj(filename, clear_ks=True, mtl_override=mtl_override)
-
     elif ext in [".gltf", ".glb"]:
-        # GLTF/GLB 走 gltf.py
-        # merge_materials=False 确保我们获取原始的多材质结构
         return gltf.load_gltf(filename, mtl_override=mtl_override, merge_materials=False)
-
     else:
         raise ValueError(f"Unsupported mesh format: '{ext}'. Please use .obj, .gltf, or .glb")
 
@@ -141,7 +112,8 @@ def auto_normals(imesh):
     v1 = imesh.v_pos[i1, :]
     v2 = imesh.v_pos[i2, :]
 
-    face_normals = torch.cross(v1 - v0, v2 - v0)
+    # [Fix] Use torch.linalg.cross instead of torch.cross to avoid warnings
+    face_normals = torch.linalg.cross(v1 - v0, v2 - v0)
 
     # Splat face normals to vertices
     v_nrm = torch.zeros_like(imesh.v_pos)
@@ -162,7 +134,6 @@ def auto_normals(imesh):
 
 ######################################################################################
 # Compute tangent space from texture map coordinates
-# Follows http://www.mikktspace.com/ conventions
 ######################################################################################
 
 def compute_tangents(imesh):
@@ -176,7 +147,6 @@ def compute_tangents(imesh):
 
     tangents = torch.zeros_like(imesh.v_nrm)
 
-    # Compute tangent space for each triangle
     uve1 = tex[1] - tex[0]
     uve2 = tex[2] - tex[0]
     pe1 = pos[1] - pos[0]
@@ -185,15 +155,12 @@ def compute_tangents(imesh):
     nom = (pe1 * uve2[..., 1:2] - pe2 * uve1[..., 1:2])
     denom = (uve1[..., 0:1] * uve2[..., 1:2] - uve1[..., 1:2] * uve2[..., 0:1])
 
-    # Avoid division by zero for degenerated texture coordinates
     tang = nom / torch.where(denom > 0.0, torch.clamp(denom, min=1e-6), torch.clamp(denom, max=-1e-6))
 
-    # Update all 3 vertices
     for i in range(0, 3):
         idx = vn_idx[i][:, None].repeat(1, 3)
-        tangents.scatter_add_(0, idx, tang)  # tangents[n_i] = tangents[n_i] + tang
+        tangents.scatter_add_(0, idx, tang)
 
-    # Normalize and make sure tangent is perpendicular to normal
     tangents = util.safe_normalize(tangents)
     tangents = util.safe_normalize(tangents - util.dot(tangents, imesh.v_nrm) * imesh.v_nrm)
 

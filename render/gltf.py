@@ -1,7 +1,9 @@
 import os
+import io
 import json
 import numpy as np
 import torch
+import imageio.v2 as imageio  # 使用 v2 接口读取内存流
 from pygltflib import GLTF2
 
 from . import mesh
@@ -11,26 +13,23 @@ from . import util
 
 
 # ==============================================================================================
-#  Load glTF / GLB
+#  Load glTF / GLB (支持嵌入式纹理)
 # ==============================================================================================
 
 @torch.no_grad()
 def load_gltf(filename, mtl_override=None, merge_materials=False):
     """
     加载 .gltf 或 .glb 文件。
-    支持读取外部 .bin 缓冲区或 GLB 内部嵌入的二进制块。
-    返回一个包含材质列表的 Mesh 对象。
+    支持读取外部 .bin/.png/.jpg 或 GLB 内部嵌入的二进制数据。
     """
     gltf_path = os.path.dirname(filename)
 
-    # 1. 使用 pygltflib 加载 (自动处理 gltf/glb 差异)
+    # 1. 使用 pygltflib 加载
     try:
-        # 使用类方法加载，确保兼容性
         doc = GLTF2.load(filename)
     except Exception as e:
         raise RuntimeError(f"Failed to load GLTF/GLB file {filename}: {e}")
 
-    # 将 doc 转换回 python dict 结构以复用解析逻辑
     gltf = json.loads(doc.to_json())
 
     # 2. 提取二进制 Buffers (修复 Method/Bytes 问题)
@@ -38,53 +37,43 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
     for i, buf in enumerate(doc.buffers):
         # 情况 A: GLB 内部嵌入的二进制块
         if buf.uri is None:
-            # 某些版本的库或异常情况下 binary_blob 可能是方法，这里做防御性编程
             blob = doc.binary_blob
-            if callable(blob):
-                blob = blob()
-            # 确保是 bytes，如果是 None 则由 b'' 替代
+            # 防御性编程：某些版本 blob 可能是一个方法
+            if callable(blob): blob = blob()
             buffers.append(blob if blob is not None else b'')
 
         # 情况 B: 外部 .bin 文件
         elif buf.uri is not None:
             try:
-                bin_path = os.path.join(gltf_path, buf.uri)
-                with open(bin_path, 'rb') as bf:
-                    # 关键修复：确保调用 read()
-                    data = bf.read()
-                    buffers.append(data)
+                # 跳过 data: 协议的 buffer (极其罕见)
+                if buf.uri.startswith("data:"):
+                    buffers.append(b'')
+                else:
+                    bin_path = os.path.join(gltf_path, buf.uri)
+                    with open(bin_path, 'rb') as bf:
+                        buffers.append(bf.read())
             except Exception as e:
                 print(f"Warning: Failed to load buffer uri {buf.uri}: {e}")
                 buffers.append(b'')
         else:
             buffers.append(b'')
 
-    # 3. 辅助函数：读取 Accessor 数据
+    # 3. 辅助函数：读取几何数据 (Accessor)
     def read_accessor(acc_idx):
         if acc_idx is None or acc_idx < 0: return None
-        # 安全检查访问器索引
         if acc_idx >= len(gltf['accessors']): return None
 
         acc = gltf['accessors'][acc_idx]
+        if 'bufferView' not in acc: return None
+
         buf_view = gltf['bufferViews'][acc['bufferView']]
         buffer_idx = buf_view.get('buffer', 0)
 
-        # 获取对应 buffer 数据
         if buffer_idx >= len(buffers): return None
         data = buffers[buffer_idx]
 
-        # 再次检查 data 类型，防止 method 混入
-        if callable(data):
-            try:
-                data = data()
-            except:
-                pass
-        if not isinstance(data, (bytes, bytearray)):
-            # 如果依然不是 bytes，打印警告并跳过，防止 crash
-            # print(f"Warning: Buffer {buffer_idx} is not bytes but {type(data)}")
-            return None
+        if not isinstance(data, (bytes, bytearray)): return None
 
-        # 计算偏移和步长
         base_offset = buf_view.get('byteOffset', 0)
         acc_offset = acc.get('byteOffset', 0)
         total_offset = base_offset + acc_offset
@@ -93,36 +82,25 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
         comp_type = acc['componentType']
         type_str = acc['type']
 
-        # 维度映射
         num_comp = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4}.get(type_str, 1)
 
-        # 类型映射
-        if comp_type == 5126:  # FLOAT
-            dtype = np.float32;
-            comp_size = 4
-        elif comp_type == 5123:  # UNSIGNED_SHORT
-            dtype = np.uint16;
-            comp_size = 2
-        elif comp_type == 5125:  # UNSIGNED_INT
-            dtype = np.uint32;
-            comp_size = 4
-        elif comp_type == 5121:  # UNSIGNED_BYTE
-            dtype = np.uint8;
-            comp_size = 1
-        elif comp_type == 5122:  # SHORT
-            dtype = np.int16;
-            comp_size = 2
+        if comp_type == 5126:
+            dtype = np.float32; comp_size = 4
+        elif comp_type == 5123:
+            dtype = np.uint16; comp_size = 2
+        elif comp_type == 5125:
+            dtype = np.uint32; comp_size = 4
+        elif comp_type == 5121:
+            dtype = np.uint8; comp_size = 1
+        elif comp_type == 5122:
+            dtype = np.int16; comp_size = 2
         else:
             return None
 
-        # 边界检查 (这里是之前报错的地方)
         expected_bytes = count * num_comp * comp_size
         if total_offset + expected_bytes > len(data):
-            print(
-                f"Warning: Buffer overflow reading accessor {acc_idx}. Data len: {len(data)}, Req: {total_offset + expected_bytes}")
             return None
 
-        # 处理步长 (Byte Stride)
         byte_stride = buf_view.get('byteStride', None)
         elem_size = num_comp * comp_size
 
@@ -136,64 +114,119 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
                 out[i] = np.frombuffer(data, dtype=dtype, count=num_comp, offset=start)
             return out
 
-    # 4. 解析图片路径 (Images)
-    image_uris = []
-    for img in gltf.get('images', []):
-        uri = img.get('uri', '')
-        image_uris.append(uri if uri else None)
+    # 4. [核心修复] 辅助函数：从 Image Index 加载纹理 (支持 BufferView)
+    def load_texture_from_img_idx(img_idx, channels=None, lambda_fn=None):
+        if img_idx is None or img_idx < 0 or img_idx >= len(gltf['images']):
+            return None
 
-    # 5. 解析纹理映射 (Textures -> Images)
-    textures_image_idx = []
-    for tex in gltf.get('textures', []):
-        src = tex.get('source', None)
-        textures_image_idx.append(src)
+        img_def = gltf['images'][img_idx]
 
-    # 6. 解析材质 (Materials)
+        # 路径 A: 外部文件 (URI)
+        uri = img_def.get('uri', None)
+        if uri:
+            if not uri.startswith('data:'):
+                img_path = os.path.join(gltf_path, uri)
+                if os.path.exists(img_path):
+                    return texture.load_texture2D(img_path, lambda_fn=lambda_fn, channels=channels)
+
+        # 路径 B: 内部嵌入数据 (BufferView) -> 这就是 GLB 缺少的逻辑！
+        if 'bufferView' in img_def:
+            bv_idx = img_def['bufferView']
+            if 0 <= bv_idx < len(gltf['bufferViews']):
+                bv = gltf['bufferViews'][bv_idx]
+                buf_idx = bv.get('buffer', 0)
+                if 0 <= buf_idx < len(buffers):
+                    blob = buffers[buf_idx]
+                    offset = bv.get('byteOffset', 0)
+                    length = bv.get('byteLength', 0)
+                    # 从大二进制块中切出图片的字节流
+                    img_bytes = blob[offset: offset + length]
+
+                    try:
+                        # 使用 imageio 直接从内存解码 (像打开文件一样)
+                        img_np = imageio.imread(io.BytesIO(img_bytes))
+
+                        # 归一化到 [0, 1] float32
+                        if img_np.dtype == np.uint8:
+                            img_np = img_np.astype(np.float32) / 255.0
+                        elif img_np.dtype == np.uint16:
+                            img_np = img_np.astype(np.float32) / 65535.0
+
+                        # 处理通道 (RGB/RGBA)
+                        if channels is not None:
+                            img_np = img_np[..., :channels]
+
+                        # 转 Tensor
+                        img_tensor = torch.tensor(img_np, dtype=torch.float32, device='cuda')
+
+                        # 后处理 (如 Normal Map 需要 *2 -1)
+                        if lambda_fn is not None:
+                            img_tensor = lambda_fn(img_tensor)
+
+                        return texture.Texture2D(img_tensor)
+                    except Exception as e:
+                        print(f"Warning: Failed to decode embedded image {img_idx}: {e}")
+                        return None
+
+        return None
+
+    # 5. 解析材质 (使用新的加载函数)
+    gltf_textures = gltf.get('textures', [])
     all_materials = []
+
     for mat_def in gltf.get('materials', []):
         name = mat_def.get('name', f'mat_{len(all_materials)}')
         m = material.Material({'name': name})
         m['bsdf'] = 'pbr'
 
+        # 默认值
         m['kd'] = texture.Texture2D(torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device='cuda'))
-        m['ks'] = texture.Texture2D(torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device='cuda'))
+        # 默认 Roughness=1.0, Metallic=0.0 (避免变成黑镜子)
+        m['ks'] = texture.Texture2D(torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device='cuda'))
 
         pbr = mat_def.get('pbrMetallicRoughness', {})
 
-        # BaseColor
-        base_color_tex_info = pbr.get('baseColorTexture', None)
-        if base_color_tex_info is not None:
-            tex_idx = base_color_tex_info.get('index', -1)
-            if 0 <= tex_idx < len(textures_image_idx):
-                img_idx = textures_image_idx[tex_idx]
-                if img_idx is not None and 0 <= img_idx < len(image_uris) and image_uris[img_idx]:
-                    img_path = os.path.join(gltf_path, image_uris[img_idx])
-                    if os.path.exists(img_path):
-                        kd_tex = texture.load_texture2D(img_path)
-                        kd_tex = texture.srgb_to_rgb(kd_tex)
+        # --- Base Color ---
+        bc_factor = pbr.get('baseColorFactor', [1.0, 1.0, 1.0, 1.0])
+        bc_factor_t = torch.tensor(bc_factor[:3], dtype=torch.float32, device='cuda')
+
+        if 'baseColorTexture' in pbr:
+            tex_idx = pbr['baseColorTexture'].get('index', -1)
+            if 0 <= tex_idx < len(gltf_textures):
+                img_idx = gltf_textures[tex_idx].get('source', None)
+                # 调用我们的超级加载器
+                kd_tex = load_texture_from_img_idx(img_idx)
+                if kd_tex is not None:
+                    kd_tex = texture.srgb_to_rgb(kd_tex)  # sRGB -> Linear
+                    # 简单乘因子 (仅支持 mip0)
+                    try:
+                        base = kd_tex.getMips()[0] * bc_factor_t.view(1, 1, 1, 3)
+                        m['kd'] = texture.Texture2D(base)
+                    except:
                         m['kd'] = kd_tex
+                else:
+                    m['kd'] = texture.Texture2D(bc_factor_t)
+        else:
+            m['kd'] = texture.Texture2D(bc_factor_t)
 
-        # MetallicRoughness
-        mr_tex_info = pbr.get('metallicRoughnessTexture', None)
-        if mr_tex_info is not None:
-            tex_idx = mr_tex_info.get('index', -1)
-            if 0 <= tex_idx < len(textures_image_idx):
-                img_idx = textures_image_idx[tex_idx]
-                if img_idx is not None and 0 <= img_idx < len(image_uris) and image_uris[img_idx]:
-                    img_path = os.path.join(gltf_path, image_uris[img_idx])
-                    if os.path.exists(img_path):
-                        m['ks'] = texture.load_texture2D(img_path, channels=3)
+        # --- Metallic Roughness ---
+        if 'metallicRoughnessTexture' in pbr:
+            tex_idx = pbr['metallicRoughnessTexture'].get('index', -1)
+            if 0 <= tex_idx < len(gltf_textures):
+                img_idx = gltf_textures[tex_idx].get('source', None)
+                # G=Roughness, B=Metallic
+                mr_tex = load_texture_from_img_idx(img_idx, channels=3)
+                if mr_tex is not None:
+                    m['ks'] = mr_tex
 
-        # Normal Map
-        norm_tex_info = mat_def.get('normalTexture', None)
-        if norm_tex_info is not None:
-            tex_idx = norm_tex_info.get('index', -1)
-            if 0 <= tex_idx < len(textures_image_idx):
-                img_idx = textures_image_idx[tex_idx]
-                if img_idx is not None and 0 <= img_idx < len(image_uris) and image_uris[img_idx]:
-                    img_path = os.path.join(gltf_path, image_uris[img_idx])
-                    if os.path.exists(img_path):
-                        m['normal'] = texture.load_texture2D(img_path, lambda_fn=lambda x: x * 2.0 - 1.0, channels=3)
+        # --- Normal Map ---
+        if 'normalTexture' in mat_def:
+            tex_idx = mat_def['normalTexture'].get('index', -1)
+            if 0 <= tex_idx < len(gltf_textures):
+                img_idx = gltf_textures[tex_idx].get('source', None)
+                n_tex = load_texture_from_img_idx(img_idx, channels=3, lambda_fn=lambda x: x * 2.0 - 1.0)
+                if n_tex is not None:
+                    m['normal'] = n_tex
 
         all_materials.append(m)
 
@@ -201,10 +234,10 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
         default_mat = material.Material({'name': 'default'})
         default_mat['bsdf'] = 'pbr'
         default_mat['kd'] = texture.Texture2D(torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device='cuda'))
-        default_mat['ks'] = texture.Texture2D(torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device='cuda'))
+        default_mat['ks'] = texture.Texture2D(torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device='cuda'))
         all_materials.append(default_mat)
 
-    # 7. 解析网格
+    # 6. 解析网格 (保持之前逻辑不变)
     pos_list = []
     nrm_list = []
     tan_list = []
@@ -245,7 +278,6 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
             if v_nrm is not None: nrm_list.append(v_nrm)
             if v_tan is not None: tan_list.append(v_tan)
             if v_uv is not None: uv_list.append(v_uv)
-
             idx_list.append(idx)
 
             num_faces = idx.shape[0]
@@ -281,11 +313,21 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
 
 
 # ==============================================================================================
-#  Save glTF (Single Material)
+#  Save glTF Functions (保持不变)
 # ==============================================================================================
 
 @torch.no_grad()
 def save_gltf(folder, mesh_obj, diffuse_only=False):
+    return _save_gltf_impl(folder, mesh_obj, diffuse_only, multi=False)
+
+
+@torch.no_grad()
+def save_gltf_multi(folder, mesh_obj, diffuse_only=False):
+    return _save_gltf_impl(folder, mesh_obj, diffuse_only, multi=True)
+
+
+@torch.no_grad()
+def _save_gltf_impl(folder, mesh_obj, diffuse_only, multi):
     os.makedirs(folder, exist_ok=True)
     base_name = os.path.basename(os.path.normpath(folder))
     bin_name = base_name + '.bin'
@@ -316,136 +358,75 @@ def save_gltf(folder, mesh_obj, diffuse_only=False):
         accessors.append(acc)
         return len(accessors) - 1
 
-    pos_idx = add_accessor(add_buffer_view(V.tobytes(), 34962), 5126, V.shape[0], "VEC3", V.min(axis=0).tolist(),
-                           V.max(axis=0).tolist())
+    pos_view = add_buffer_view(V.tobytes(), 34962)
+    pos_idx = add_accessor(pos_view, 5126, V.shape[0], "VEC3", V.min(axis=0).tolist(), V.max(axis=0).tolist())
 
     uv_idx = None
     if UV is not None:
-        uv_idx = add_accessor(add_buffer_view(UV.tobytes(), 34962), 5126, UV.shape[0], "VEC2")
-
-    indices_flat = F.flatten()
-    if indices_flat.max() < 65536:
-        ind_bytes = indices_flat.astype(np.uint16).tobytes()
-        comp_type = 5123
-    else:
-        ind_bytes = indices_flat.astype(np.uint32).tobytes()
-        comp_type = 5125
-    ind_idx = add_accessor(add_buffer_view(ind_bytes, 34963), comp_type, indices_flat.shape[0], "SCALAR")
+        uv_view = add_buffer_view(UV.tobytes(), 34962)
+        uv_idx = add_accessor(uv_view, 5126, UV.shape[0], "VEC2")
 
     images = []
     textures = []
     materials = []
+    primitives = []
 
-    mat = mesh_obj.material
-    tex_name = "texture_base.png"
-    tex_path = os.path.join(folder, tex_name)
-    texture.save_texture2D(tex_path, texture.rgb_to_srgb(mat['kd']))
+    mats_to_export = mesh_obj.materials if multi and hasattr(mesh_obj, 'materials') and mesh_obj.materials else [
+        mesh_obj.material]
 
-    images.append({"uri": tex_name})
-    textures.append({"sampler": 0, "source": 0})
-
-    materials.append({
-        "name": "baked_material",
-        "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}, "metallicFactor": 0.0, "roughnessFactor": 1.0},
-        "doubleSided": True
-    })
-
-    gltf_json = {
-        "asset": {"version": "2.0"},
-        "buffers": [{"uri": bin_name, "byteLength": len(buffer_data)}],
-        "bufferViews": buffer_views,
-        "accessors": accessors,
-        "samplers": [{"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}],
-        "images": images,
-        "textures": textures,
-        "materials": materials,
-        "meshes": [{"name": "mesh", "primitives": [
-            {"attributes": {"POSITION": pos_idx, "TEXCOORD_0": uv_idx}, "indices": ind_idx, "material": 0,
-             "mode": 4}]}],
-        "nodes": [{"name": "root", "mesh": 0}],
-        "scenes": [{"nodes": [0]}],
-        "scene": 0
-    }
-
-    with open(gltf_filename, 'w') as f:
-        json.dump(gltf_json, f, indent=2)
-    with open(bin_filename, 'wb') as f:
-        f.write(buffer_data)
-
-
-# ==============================================================================================
-#  Save glTF (Multi-Material)
-# ==============================================================================================
-
-@torch.no_grad()
-def save_gltf_multi(folder, mesh_obj, diffuse_only=False):
-    os.makedirs(folder, exist_ok=True)
-    base_name = os.path.basename(os.path.normpath(folder))
-    bin_name = base_name + '.bin'
-    gltf_name = base_name + '.gltf'
-    bin_filename = os.path.join(folder, bin_name)
-    gltf_filename = os.path.join(folder, gltf_name)
-
-    V = mesh_obj.v_pos.detach().cpu().numpy().astype(np.float32)
-    UV = mesh_obj.v_tex.detach().cpu().numpy().astype(np.float32)
-    F = mesh_obj.t_pos_idx.detach().cpu().numpy()
-    MF = mesh_obj.face_material_idx.detach().cpu().numpy()
-
-    buffer_data = bytearray()
-    buffer_views = []
-    accessors = []
-
-    def add_buffer_view(data_bytes, target):
-        view_idx = len(buffer_views)
-        offset = len(buffer_data)
-        buffer_data.extend(data_bytes)
-        while len(buffer_data) % 4 != 0: buffer_data.append(0)
-        buffer_views.append({"buffer": 0, "byteOffset": offset, "byteLength": len(data_bytes), "target": target})
-        return view_idx
-
-    def add_accessor(view_idx, comp_type, count, type_str, min_val=None, max_val=None):
-        acc = {"bufferView": view_idx, "byteOffset": 0, "componentType": comp_type, "count": count, "type": type_str}
-        if min_val is not None: acc["min"] = min_val
-        if max_val is not None: acc["max"] = max_val
-        accessors.append(acc)
-        return len(accessors) - 1
-
-    pos_view = add_buffer_view(V.tobytes(), 34962)
-    pos_idx = add_accessor(pos_view, 5126, V.shape[0], "VEC3", V.min(axis=0).tolist(), V.max(axis=0).tolist())
-    uv_view = add_buffer_view(UV.tobytes(), 34962)
-    uv_idx = add_accessor(uv_view, 5126, UV.shape[0], "VEC2")
-
-    images = []
-    textures = []
-    materials = []
-
-    for i, mat in enumerate(mesh_obj.materials):
-        tex_name = f"mat_{i}_diffuse.png"
+    for i, mat in enumerate(mats_to_export):
+        tex_name = f"mat_{i}_diffuse.png" if multi else "texture_base.png"
         tex_path = os.path.join(folder, tex_name)
-        texture.save_texture2D(tex_path, texture.rgb_to_srgb(mat['kd']))
+
+        kd_map = mat['kd']
+        texture.save_texture2D(tex_path, texture.rgb_to_srgb(kd_map))
+
         images.append({"uri": tex_name})
         textures.append({"sampler": 0, "source": i})
         materials.append({
-            "name": getattr(mat, 'name', f"material_{i}"),
+            "name": getattr(mat, 'name', f"mat_{i}"),
             "pbrMetallicRoughness": {"baseColorTexture": {"index": i}, "metallicFactor": 0.0, "roughnessFactor": 1.0},
             "doubleSided": True
         })
 
-    primitives = []
-    unique_mats = np.unique(MF)
-    for m_id in unique_mats:
-        mask = (MF == m_id)
-        sub_faces = F[mask].flatten()
-        if sub_faces.max() < 65536:
-            ind_bytes = sub_faces.astype(np.uint16).tobytes();
+    if multi and mesh_obj.face_material_idx is not None:
+        MF = mesh_obj.face_material_idx.detach().cpu().numpy()
+        unique_mats = np.unique(MF)
+        for m_id in unique_mats:
+            mask = (MF == m_id)
+            sub_faces = F[mask].flatten()
+            if sub_faces.size == 0: continue
+
+            if sub_faces.max() < 65536:
+                ind_bytes = sub_faces.astype(np.uint16).tobytes();
+                comp = 5123
+            else:
+                ind_bytes = sub_faces.astype(np.uint32).tobytes();
+                comp = 5125
+            ind_idx = add_accessor(add_buffer_view(ind_bytes, 34963), comp, sub_faces.shape[0], "SCALAR")
+
+            primitives.append({
+                "attributes": {"POSITION": pos_idx, "TEXCOORD_0": uv_idx} if uv_idx is not None else {
+                    "POSITION": pos_idx},
+                "indices": ind_idx,
+                "material": int(m_id),
+                "mode": 4
+            })
+    else:
+        indices_flat = F.flatten()
+        if indices_flat.max() < 65536:
+            ind_bytes = indices_flat.astype(np.uint16).tobytes();
             comp = 5123
         else:
-            ind_bytes = sub_faces.astype(np.uint32).tobytes();
+            ind_bytes = indices_flat.astype(np.uint32).tobytes();
             comp = 5125
-        ind_idx = add_accessor(add_buffer_view(ind_bytes, 34963), comp, sub_faces.shape[0], "SCALAR")
-        primitives.append(
-            {"attributes": {"POSITION": pos_idx, "TEXCOORD_0": uv_idx}, "indices": ind_idx, "material": int(m_id),
-             "mode": 4})
+        ind_idx = add_accessor(add_buffer_view(ind_bytes, 34963), comp, indices_flat.shape[0], "SCALAR")
+        primitives.append({
+            "attributes": {"POSITION": pos_idx, "TEXCOORD_0": uv_idx} if uv_idx is not None else {"POSITION": pos_idx},
+            "indices": ind_idx,
+            "material": 0,
+            "mode": 4
+        })
 
     gltf_json = {
         "asset": {"version": "2.0"},
