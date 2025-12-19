@@ -14,12 +14,15 @@ from . import util
 from . import renderutils as ru
 from . import light
 
+
 # ==============================================================================================
 #  Helper functions
 # ==============================================================================================
 
 def interpolate(attr, rast, attr_idx, rast_db=None):
-    return dr.interpolate(attr.contiguous(), rast, attr_idx, rast_db=rast_db, diff_attrs=None if rast_db is None else 'all')
+    return dr.interpolate(attr.contiguous(), rast, attr_idx, rast_db=rast_db,
+                          diff_attrs=None if rast_db is None else 'all')
+
 
 # ==============================================================================================
 #  pixel shader
@@ -36,30 +39,31 @@ def shade(
         lgt,
         material,
         bsdf
-    ):
-
+):
     ################################################################################
     # Texture lookups
     ################################################################################
     perturbed_nrm = None
     if 'kd_ks_normal' in material:
         # Combined texture, used for MLPs because lookups are expensive
-        all_tex_jitter = material['kd_ks_normal'].sample(gb_pos + torch.normal(mean=0, std=0.01, size=gb_pos.shape, device="cuda"))
+        all_tex_jitter = material['kd_ks_normal'].sample(
+            gb_pos + torch.normal(mean=0, std=0.01, size=gb_pos.shape, device="cuda"))
         all_tex = material['kd_ks_normal'].sample(gb_pos)
         assert all_tex.shape[-1] == 9 or all_tex.shape[-1] == 10, "Combined kd_ks_normal must be 9 or 10 channels"
         kd, ks, perturbed_nrm = all_tex[..., :-6], all_tex[..., -6:-3], all_tex[..., -3:]
         # Compute albedo (kd) gradient, used for material regularizer
-        kd_grad    = torch.sum(torch.abs(all_tex_jitter[..., :-6] - all_tex[..., :-6]), dim=-1, keepdim=True) / 3
+        kd_grad = torch.sum(torch.abs(all_tex_jitter[..., :-6] - all_tex[..., :-6]), dim=-1, keepdim=True) / 3
     else:
-        kd_jitter  = material['kd'].sample(gb_texc + torch.normal(mean=0, std=0.005, size=gb_texc.shape, device="cuda"), gb_texc_deriv)
+        kd_jitter = material['kd'].sample(gb_texc + torch.normal(mean=0, std=0.005, size=gb_texc.shape, device="cuda"),
+                                          gb_texc_deriv)
         kd = material['kd'].sample(gb_texc, gb_texc_deriv)
-        ks = material['ks'].sample(gb_texc, gb_texc_deriv)[..., 0:3] # skip alpha
+        ks = material['ks'].sample(gb_texc, gb_texc_deriv)[..., 0:3]  # skip alpha
         if 'normal' in material:
             perturbed_nrm = material['normal'].sample(gb_texc, gb_texc_deriv)
-        kd_grad    = torch.sum(torch.abs(kd_jitter[..., 0:3] - kd[..., 0:3]), dim=-1, keepdim=True) / 3
+        kd_grad = torch.sum(torch.abs(kd_jitter[..., 0:3] - kd[..., 0:3]), dim=-1, keepdim=True) / 3
 
     # Separate kd into alpha and color, default alpha = 1
-    alpha = kd[..., 3:4] if kd.shape[-1] == 4 else torch.ones_like(kd[..., 0:1]) 
+    alpha = kd[..., 3:4] if kd.shape[-1] == 4 else torch.ones_like(kd[..., 0:1])
     kd = kd[..., 0:3]
 
     ################################################################################
@@ -68,7 +72,8 @@ def shade(
     if 'no_perturbed_nrm' in material and material['no_perturbed_nrm']:
         perturbed_nrm = None
 
-    gb_normal = ru.prepare_shading_normal(gb_pos, view_pos, perturbed_nrm, gb_normal, gb_tangent, gb_geometric_normal, two_sided_shading=True, opengl=True)
+    gb_normal = ru.prepare_shading_normal(gb_pos, view_pos, perturbed_nrm, gb_normal, gb_tangent, gb_geometric_normal,
+                                          two_sided_shading=True, opengl=True)
 
     ################################################################################
     # Evaluate BSDF
@@ -87,23 +92,24 @@ def shade(
         else:
             assert False, "Invalid light type"
     elif bsdf == 'normal':
-        shaded_col = (gb_normal + 1.0)*0.5
+        shaded_col = (gb_normal + 1.0) * 0.5
     elif bsdf == 'tangent':
-        shaded_col = (gb_tangent + 1.0)*0.5
+        shaded_col = (gb_tangent + 1.0) * 0.5
     elif bsdf == 'kd':
         shaded_col = kd
     elif bsdf == 'ks':
         shaded_col = ks
     else:
         assert False, "Invalid BSDF '%s'" % bsdf
-    
+
     # Return multiple buffers
     buffers = {
-        'shaded'    : torch.cat((shaded_col, alpha), dim=-1),
-        'kd_grad'   : torch.cat((kd_grad, alpha), dim=-1),
-        'occlusion' : torch.cat((ks[..., :1], alpha), dim=-1)
+        'shaded': torch.cat((shaded_col, alpha), dim=-1),
+        'kd_grad': torch.cat((kd_grad, alpha), dim=-1),
+        'occlusion': torch.cat((ks[..., :1], alpha), dim=-1)
     }
     return buffers
+
 
 # ==============================================================================================
 #  Render a depth slice of the mesh (scene), some limitations:
@@ -122,9 +128,8 @@ def render_layer(
         spp,
         msaa,
         bsdf
-    ):
-
-    full_res = [resolution[0]*spp, resolution[1]*spp]
+):
+    full_res = [resolution[0] * spp, resolution[1] * spp]
 
     ################################################################################
     # Rasterize
@@ -150,17 +155,19 @@ def render_layer(
     v1 = mesh.v_pos[mesh.t_pos_idx[:, 1], :]
     v2 = mesh.v_pos[mesh.t_pos_idx[:, 2], :]
     face_normals = util.safe_normalize(torch.cross(v1 - v0, v2 - v0))
-    face_normal_indices = (torch.arange(0, face_normals.shape[0], dtype=torch.int64, device='cuda')[:, None]).repeat(1, 3)
+    face_normal_indices = (torch.arange(0, face_normals.shape[0], dtype=torch.int64, device='cuda')[:, None]).repeat(1,
+                                                                                                                     3)
     gb_geometric_normal, _ = interpolate(face_normals[None, ...], rast_out_s, face_normal_indices.int())
 
     # Compute tangent space
     assert mesh.v_nrm is not None and mesh.v_tng is not None
     gb_normal, _ = interpolate(mesh.v_nrm[None, ...], rast_out_s, mesh.t_nrm_idx.int())
-    gb_tangent, _ = interpolate(mesh.v_tng[None, ...], rast_out_s, mesh.t_tng_idx.int()) # Interpolate tangents
+    gb_tangent, _ = interpolate(mesh.v_tng[None, ...], rast_out_s, mesh.t_tng_idx.int())  # Interpolate tangents
 
     # Texture coordinate
     assert mesh.v_tex is not None
-    gb_texc, gb_texc_deriv = interpolate(mesh.v_tex[None, ...], rast_out_s, mesh.t_tex_idx.int(), rast_db=rast_out_deriv_s)
+    gb_texc, gb_texc_deriv = interpolate(mesh.v_tex[None, ...], rast_out_s, mesh.t_tex_idx.int(),
+                                         rast_db=rast_out_deriv_s)
 
     ################################################################################
     # Shade
@@ -195,7 +202,7 @@ def render_layer(
         buffers = buffers_accum
     else:
         buffers = shade(gb_pos, gb_geometric_normal, gb_normal, gb_tangent, gb_texc, gb_texc_deriv,
-            view_pos, lgt, mesh.material, bsdf)
+                        view_pos, lgt, mesh.material, bsdf)
 
     ################################################################################
     # Prepare output
@@ -208,6 +215,7 @@ def render_layer(
 
     # Return buffers
     return buffers
+
 
 # ==============================================================================================
 #  Render a depth peeled mesh (scene), some limitations:
@@ -223,22 +231,23 @@ def render_mesh(
         view_pos,
         lgt,
         resolution,
-        spp         = 1,
-        num_layers  = 1,
-        msaa        = False,
-        background  = None, 
-        bsdf        = None
-    ):
-
+        spp=1,
+        num_layers=1,
+        msaa=False,
+        background=None,
+        bsdf=None
+):
     def prepare_input_vector(x):
         x = torch.tensor(x, dtype=torch.float32, device='cuda') if not torch.is_tensor(x) else x
         return x[:, None, None, :] if len(x.shape) == 2 else x
-    
+
     def composite_buffer(key, layers, background, antialias):
         accum = background
         for buffers, rast in reversed(layers):
             alpha = (rast[..., -1:] > 0).float() * buffers[key][..., -1:]
-            accum = torch.lerp(accum, torch.cat((buffers[key][..., :-1], torch.ones_like(buffers[key][..., -1:])), dim=-1), alpha)
+            accum = torch.lerp(accum,
+                               torch.cat((buffers[key][..., :-1], torch.ones_like(buffers[key][..., -1:])), dim=-1),
+                               alpha)
             if antialias:
                 accum = dr.antialias(accum.contiguous(), rast, v_pos_clip, mesh.t_pos_idx.int())
         return accum
@@ -246,11 +255,11 @@ def render_mesh(
     assert mesh.t_pos_idx.shape[0] > 0, "Got empty training triangle mesh (unrecoverable discontinuity)"
     assert background is None or (background.shape[1] == resolution[0] and background.shape[2] == resolution[1])
 
-    full_res = [resolution[0]*spp, resolution[1]*spp]
+    full_res = [resolution[0] * spp, resolution[1] * spp]
 
     # Convert numpy arrays to torch tensors
-    mtx_in      = torch.tensor(mtx_in, dtype=torch.float32, device='cuda') if not torch.is_tensor(mtx_in) else mtx_in
-    view_pos    = prepare_input_vector(view_pos)
+    mtx_in = torch.tensor(mtx_in, dtype=torch.float32, device='cuda') if not torch.is_tensor(mtx_in) else mtx_in
+    view_pos = prepare_input_vector(view_pos)
 
     # clip space transform
     v_pos_clip = ru.xfm_points(mesh.v_pos[None, ...], mtx_in)
@@ -283,6 +292,7 @@ def render_mesh(
 
     return out_buffers
 
+
 # ==============================================================================================
 #  Render multiple meshes
 # ==============================================================================================
@@ -299,9 +309,9 @@ def render_meshes(
         msaa=False,
         background=None,
         bsdf=None
-    ):
+):
     # Prepare background
-    full_res = [resolution[0]*spp, resolution[1]*spp]
+    full_res = [resolution[0] * spp, resolution[1] * spp]
     if background is not None:
         if spp > 1:
             background = util.scale_img_nhwc(background, full_res, mag='nearest', min='nearest')
@@ -311,10 +321,10 @@ def render_meshes(
 
     # Composite each mesh front-to-back using premultiplied alpha-over
     for m in meshes:
-        out = render_mesh(ctx, m, mtx_in, view_pos, lgt, resolution, spp=spp, num_layers=num_layers, msaa=msaa, background=None, bsdf=bsdf)
+        out = render_mesh(ctx, m, mtx_in, view_pos, lgt, resolution, spp=spp, num_layers=num_layers, msaa=msaa,
+                          background=None, bsdf=bsdf)
         col = out['shaded']
         alpha = col[..., -1:]
         accum = torch.lerp(accum, torch.cat((col[..., :-1], torch.ones_like(alpha)), dim=-1), alpha)
 
     return {'shaded': accum}
-

@@ -114,7 +114,7 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
                 out[i] = np.frombuffer(data, dtype=dtype, count=num_comp, offset=start)
             return out
 
-    # 4. [核心修复] 辅助函数：从 Image Index 加载纹理 (支持 BufferView)
+    # 4. 从 Image Index 加载纹理 (支持 BufferView)
     def load_texture_from_img_idx(img_idx, channels=None, lambda_fn=None):
         if img_idx is None or img_idx < 0 or img_idx >= len(gltf['images']):
             return None
@@ -170,7 +170,7 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
 
         return None
 
-    # 5. 解析材质 (使用新的加载函数)
+    # 5. 解析材质
     gltf_textures = gltf.get('textures', [])
     all_materials = []
 
@@ -181,8 +181,8 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
 
         # 默认值
         m['kd'] = texture.Texture2D(torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device='cuda'))
-        # 默认 Roughness=1.0, Metallic=0.0 (避免变成黑镜子)
-        m['ks'] = texture.Texture2D(torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device='cuda'))
+        # 默认 Roughness=0.5, Metallic=0.0 (避免变成黑镜子)
+        m['ks'] = texture.Texture2D(torch.tensor([0.0, 0.5, 0.0], dtype=torch.float32, device='cuda'))
 
         pbr = mat_def.get('pbrMetallicRoughness', {})
 
@@ -210,6 +210,9 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
             m['kd'] = texture.Texture2D(bc_factor_t)
 
         # --- Metallic Roughness ---
+        met_factor = pbr.get('metallicFactor', 1.0)
+        rgh_factor = pbr.get('roughnessFactor', 1.0)
+
         if 'metallicRoughnessTexture' in pbr:
             tex_idx = pbr['metallicRoughnessTexture'].get('index', -1)
             if 0 <= tex_idx < len(gltf_textures):
@@ -217,7 +220,23 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
                 # G=Roughness, B=Metallic
                 mr_tex = load_texture_from_img_idx(img_idx, channels=3)
                 if mr_tex is not None:
-                    m['ks'] = mr_tex
+                    # 必须处理数据！
+                    # 1. 强制清零 R 通道 (AO)，防止模型变黑
+                    # 2. 应用因子
+                    try:
+                        base = mr_tex.getMips()[0]
+                        # 创建一个全0的R通道
+                        zero_r = torch.zeros_like(base[..., 0:1])
+                        # 提取 G (Roughness) 和 B (Metallic)
+                        g_rough = base[..., 1:2] * rgh_factor
+                        b_metal = base[..., 2:3] * met_factor
+
+                        # 重新组合为 [0, Roughness, Metallic]
+                        new_ks = torch.cat([zero_r, g_rough, b_metal], dim=-1)
+                        m['ks'] = texture.Texture2D(new_ks)
+                    except:
+                        # Fallback
+                        m['ks'] = mr_tex
 
         # --- Normal Map ---
         if 'normalTexture' in mat_def:

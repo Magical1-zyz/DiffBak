@@ -30,12 +30,69 @@ def _str2bool(v):
 
 
 @torch.no_grad()
+def render_env_background(envlight, resolution, mv, fovy):
+    """
+    通过射线投射采样环境贴图生成背景
+    """
+    h, w = resolution
+
+    # 1. 生成相机空间的射线 (NDC -> Camera Space)
+    # PyTorch meshgrid 生成 (y, x)
+    gy, gx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, h, device='cuda'),
+        torch.linspace(-1.0, 1.0, w, device='cuda'),
+        indexing='ij'
+    )
+
+    aspect = w / h
+    tan_half_fov = np.tan(fovy / 2.0)
+
+    # 修正坐标系方向 (匹配 nvdiffrast/OpenGL)
+    cam_x = gx * tan_half_fov * aspect
+    cam_y = -gy * tan_half_fov
+    cam_z = -torch.ones_like(gx)
+
+    cam_dirs = torch.stack((cam_x, cam_y, cam_z), dim=-1)  # [H, W, 3]
+    cam_dirs = util.safe_normalize(cam_dirs)
+
+    # 2. 转换到世界空间 (Camera Space -> World Space)
+    # mv 是 World-to-Camera [1, 4, 4]
+    inv_mv = torch.linalg.inv(mv[0])
+    rotation = inv_mv[:3, :3]
+
+    world_dirs = cam_dirs @ rotation.T
+
+    # 3. 采样环境贴图
+    env_col = dr.texture(
+        envlight.base[None, ...],
+        world_dirs[None, ...].contiguous(),
+        filter_mode='linear',
+        boundary_mode='cube'
+    )
+
+    return env_col  # [1, H, W, 3]
+
+
+@torch.no_grad()
 def composite_background(image_rgba, bg_color):
     """合成背景色用于可视化"""
-    rgb = image_rgba[..., 0:3]
-    alpha = image_rgba[..., 3:4]
-    bg = bg_color.view(1, 1, 1, 3).to(image_rgba.device)
-    return rgb * alpha + bg * (1.0 - alpha)
+    # 1. 提取 RGB 和 Alpha
+    if image_rgba.shape[-1] >= 4:
+        rgb = image_rgba[..., 0:3]
+        alpha = image_rgba[..., 3:4]
+    else:
+        # 如果只有3通道，假设完全不透明
+        rgb = image_rgba[..., 0:3]
+        alpha = torch.ones_like(rgb[..., 0:1])
+
+    # 2. 处理背景
+    # 如果背景是纯色 [3]，扩展维度以匹配广播
+    if bg_color.ndim == 1:
+        bg = bg_color.view(1, 1, 1, 3).to(image_rgba.device)
+    # 如果背景是图片 [1, H, W, 3]，直接使用
+
+    # 3. 合成
+    return rgb * alpha + bg_color * (1.0 - alpha)
 
 
 @torch.no_grad()
@@ -140,6 +197,16 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
     v_pos = base_mesh.v_pos.detach().cpu().numpy()
     t_pos_idx = base_mesh.t_pos_idx.detach().cpu().numpy()
 
+    # 使用原始法线
+    v_nrm_orig = None
+    if base_mesh.v_nrm is not None:
+        v_nrm_orig = base_mesh.v_nrm.detach().cpu().numpy()
+    else:
+        # 如果原始模型本身没法线，先在拓扑完整的原始模型上算一遍平滑法线
+        print("      [Mesh] Computing auto_normals on original topology...")
+        temp_mesh = mesh.auto_normals(base_mesh)
+        v_nrm_orig = temp_mesh.v_nrm.detach().cpu().numpy()
+
     has_uv = base_mesh.v_tex is not None and base_mesh.t_tex_idx is not None
 
     mat_indices = np.zeros(t_pos_idx.shape[0], dtype=np.int32)
@@ -151,6 +218,11 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
         if not has_uv:
             raise ValueError("Requested --use_custom_uv but the mesh has no UVs!")
         print(f"      [UV] Mode: Using Original UVs (Skip xatlas)")
+
+        # 即使不重分UV，也要确保切线空间正确
+        if base_mesh.v_tng is None:
+            base_mesh = mesh.compute_tangents(base_mesh)
+
         if multi_materials:
             unique_mats = np.unique(mat_indices)
             return base_mesh, unique_mats
@@ -159,29 +231,52 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
             return base_mesh, [0]
 
     # 模式 B: xatlas 自动展开
+
+    # 内部辅助函数：构建新 Mesh 并映射法线
+    def build_new_mesh(v_pos_in, t_pos_idx_in, v_nrm_in, vmapping, indices, uvs, materials_list=None,
+                       face_mat_idx=None):
+        indices_int64 = indices.astype(np.uint64, casting='same_kind').view(np.int64)
+
+        # 1. 映射顶点位置
+        new_v_pos = torch.from_numpy(v_pos_in[vmapping]).to(device='cuda', dtype=torch.float32)
+
+        # 2. 映射法线
+        # vmapping[i] 表示新顶点 i 对应原始模型的哪个顶点。
+        # 我们直接把原始模型的平滑法线拿过来，这样即使 UV 接缝处顶点断开了，法线依然是连续的。
+        new_v_nrm = torch.from_numpy(v_nrm_in[vmapping]).to(device='cuda', dtype=torch.float32)
+
+        # 3. 构建 Mesh
+        new_mesh_obj = mesh.Mesh(
+            v_pos=new_v_pos,
+            t_pos_idx=torch.from_numpy(indices_int64).to(device='cuda', dtype=torch.int64),
+            v_nrm=new_v_nrm,  # 使用映射过来的正确法线
+            t_nrm_idx=torch.from_numpy(indices_int64).to(device='cuda', dtype=torch.int64),  # 法线索引与位置对齐
+            v_tex=torch.from_numpy(uvs).to(device='cuda', dtype=torch.float32),
+            t_tex_idx=torch.from_numpy(indices_int64).to(device='cuda', dtype=torch.int64),
+            material=None,
+            materials=materials_list,
+            face_material_idx=face_mat_idx
+        )
+
+        # 4. 只计算切线 (切线依赖 UV，必须重算，但基础法线是正确的)
+        new_mesh_obj = mesh.compute_tangents(new_mesh_obj)
+        return new_mesh_obj
+
     if not multi_materials:
         print(f"      [UV] Mode: Single Material Atlas (Running xatlas...)")
         start_x = time.time()
         vmapping, indices, uvs = xatlas.parametrize(v_pos, t_pos_idx)
-        print(f"           xatlas finished in {time.time() - start_x:.2f}s")
+        print(
+            f"           xatlas finished in {time.time() - start_x:.2f}s. Tris: {t_pos_idx.shape[0]} -> {indices.shape[0]}")
 
-        indices_int64 = indices.astype(np.uint64, casting='same_kind').view(np.int64)
+        # 这里的 v_nrm_orig 就是最上面准备好的正确法线
+        return build_new_mesh(v_pos, t_pos_idx, v_nrm_orig, vmapping, indices, uvs), [0]
 
-        new_mesh = mesh.Mesh(
-            v_pos=torch.from_numpy(v_pos[vmapping]).to(device='cuda', dtype=torch.float32),
-            t_pos_idx=torch.from_numpy(indices_int64).to(device='cuda', dtype=torch.int64),
-            v_tex=torch.from_numpy(uvs).to(device='cuda', dtype=torch.float32),
-            t_tex_idx=torch.from_numpy(indices_int64).to(device='cuda', dtype=torch.int64),
-            material=None
-        )
-        new_mesh = mesh.auto_normals(new_mesh)
-        new_mesh = mesh.compute_tangents(new_mesh)
-        return new_mesh, [0]
     else:
         unique_mats = np.unique(mat_indices)
         print(f"      [UV] Mode: Multi-Material ({len(unique_mats)} materials) (Running xatlas...)")
 
-        final_v, final_f, final_uv, final_mid = [], [], [], []
+        final_v, final_n, final_f, final_uv, final_mid = [], [], [], [], []
         global_v_offset = 0
         active_mat_ids = []
 
@@ -190,19 +285,22 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
             mask = (mat_indices == m_id)
             sub_faces_global = t_pos_idx[mask]
 
+            # 提取子网格
             used_v, sub_faces_local = np.unique(sub_faces_global, return_inverse=True)
             sub_faces_local = sub_faces_local.reshape(-1, 3)
             sub_v_pos = v_pos[used_v]
+            sub_v_nrm = v_nrm_orig[used_v]  # 提取对应的正确法线
 
             vmapping, indices, uvs = xatlas.parametrize(sub_v_pos, sub_faces_local)
 
-            remapped_v_pos = sub_v_pos[vmapping]
-            final_v.append(remapped_v_pos)
+            # 映射属性
+            final_v.append(sub_v_pos[vmapping])
+            final_n.append(sub_v_nrm[vmapping])  # 映射法线
             final_uv.append(uvs)
             final_f.append(indices + global_v_offset)
             final_mid.append(np.full(indices.shape[0], m_id, dtype=np.int64))
 
-            global_v_offset += remapped_v_pos.shape[0]
+            global_v_offset += vmapping.shape[0]
             active_mat_ids.append(m_id)
         print(f"           xatlas finished in {time.time() - start_x:.2f}s")
 
@@ -211,12 +309,13 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
         new_mesh = mesh.Mesh(
             v_pos=torch.from_numpy(np.concatenate(final_v, axis=0)).to(device='cuda', dtype=torch.float32),
             t_pos_idx=torch.from_numpy(indices_int64).to(device='cuda', dtype=torch.int64),
+            v_nrm=torch.from_numpy(np.concatenate(final_n, axis=0)).to(device='cuda', dtype=torch.float32),
+            t_nrm_idx=torch.from_numpy(indices_int64).to(device='cuda', dtype=torch.int64),
             v_tex=torch.from_numpy(np.concatenate(final_uv, axis=0)).to(device='cuda', dtype=torch.float32),
             t_tex_idx=torch.from_numpy(indices_int64).to(device='cuda', dtype=torch.int64),
             face_material_idx=torch.from_numpy(np.concatenate(final_mid, axis=0)).to(device='cuda', dtype=torch.int64),
             material=None, materials=[]
         )
-        new_mesh = mesh.auto_normals(new_mesh)
         new_mesh = mesh.compute_tangents(new_mesh)
         return new_mesh, active_mat_ids
 
@@ -228,35 +327,47 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
 def main():
     parser = argparse.ArgumentParser(description='Texture Baking Tool')
 
+    # 基础参数
     parser.add_argument('--config', type=str, default=None, help='Config JSON file')
     parser.add_argument('-rm', '--ref_mesh', type=str, default=None, help='High-poly reference')
     parser.add_argument('-bm', '--base_mesh', type=str, default=None, help='Low-poly target')
     parser.add_argument('-o', '--out-dir', type=str, default='out/baking_result')
 
+    # 烘焙选项
     parser.add_argument('--multi_materials', type=_str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--use_custom_uv', type=_str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--texture_res', nargs=2, type=int, default=[4096, 4096])
 
+    # 训练参数
     parser.add_argument('--iter', type=int, default=3000)
     parser.add_argument('--batch', type=int, default=1)
     parser.add_argument('--lr', type=float, default=0.03)
     parser.add_argument('--train_res', nargs=2, type=int, default=[1024, 1024])
     parser.add_argument('--spp', type=int, default=2)
-
     parser.add_argument('--loss_type', type=str, default='logl1')
     parser.add_argument('--smooth_weight', type=float, default=0.02)
+    parser.add_argument('--coarse_to_fine', type=_str2bool, nargs='?', const=True, default=True)
+    parser.add_argument('--amp', type=_str2bool, nargs='?', const=True, default=True)
 
+    # 环境与相机
     parser.add_argument('--envmap', type=str, default=None)
     parser.add_argument('--env_scale', type=float, default=1.0)
     parser.add_argument('--cam_radius_scale', type=float, default=2.0)
     parser.add_argument('--cam_near_far', nargs=2, type=float, default=[0.1, 1000.0])
     parser.add_argument('--background_rgb', nargs=3, type=float, default=[0.0, 0.0, 0.0])
+    parser.add_argument('--cam_views_top', type=int, default=64, help='Number of views for top hemisphere')
+    parser.add_argument('--cam_views_bottom', type=int, default=16, help='Number of views for bottom hemisphere')
+
+    # 显示与导出
     parser.add_argument('--display_interval', type=int, default=50)
     parser.add_argument('--save_interval', type=int, default=100)
     parser.add_argument('--max_display_width', type=int, default=1600)
+    parser.add_argument('--use_opt_pbr', type=_str2bool, nargs='?', const=True, default=False,
+                        help='Use PBR shading for the optimized mesh (Default: Unlit/KD only)')
 
-    parser.add_argument('--coarse_to_fine', type=_str2bool, nargs='?', const=True, default=True)
-    parser.add_argument('--amp', type=_str2bool, nargs='?', const=True, default=True)
+    # 是否渲染 HDR 环境背景
+    parser.add_argument('--render_env_bg', type=_str2bool, nargs='?', const=True, default=False,
+                        help='Render HDR environment map as background in visualization')
 
     FLAGS = parser.parse_args()
 
@@ -270,6 +381,8 @@ def main():
 
     if FLAGS.ref_mesh is None: raise ValueError("Reference mesh required.")
     if FLAGS.base_mesh is None: raise ValueError("Base mesh required.")
+
+    target_bsdf = 'pbr' if FLAGS.use_opt_pbr else 'kd'
 
     print(f"\n=== Texture Baking Config ===")
     print(f" Ref: {FLAGS.ref_mesh}")
@@ -342,13 +455,21 @@ def main():
     print(f"[3/5] Setup Optimization...")
     geometry = DLMesh(base_mesh, FLAGS)
     train_mats, params = [], []
-    ks_init = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device='cuda')
+
+    if FLAGS.use_opt_pbr:
+        # UE 默认: Metallic=0 (B), Roughness=0.5 (G), Specular=0.5 (Implied F0=0.04)
+        ks_val = [0.0, 0.5, 0.0]
+    else:
+        # KD 模式: 默认全哑光
+        ks_val = [0.0, 1.0, 0.0]
+
+    ks_init = torch.tensor(ks_val, dtype=torch.float32, device='cuda')
 
     for m_id in active_mat_ids:
         kd_init = torch.full((FLAGS.texture_res[0], FLAGS.texture_res[1], 3), 0.5, dtype=torch.float32, device='cuda')
         m = material.Material({
             'name': f'baked_mat_{m_id}',
-            'bsdf': 'kd',
+            'bsdf': target_bsdf,
             'kd': texture.Texture2D(kd_init),
             'ks': texture.Texture2D(ks_init)
         })
@@ -410,7 +531,7 @@ def main():
 
         with torch.cuda.amp.autocast(enabled=FLAGS.amp):
             buffers = render.render_mesh(glctx, geometry.mesh, mvp, campos, lgt, curr_res, spp=curr_spp, msaa=True,
-                                         bsdf='kd')
+                                         bsdf=target_bsdf)
             loss, stats = criterion(buffers['shaded'], target, buffers.get('kd_grad', None))
 
         scaler.scale(loss).backward()
@@ -434,9 +555,23 @@ def main():
                 opt_v = composite_background(buffers['shaded'][idx:idx + 1], bg_tensor)
                 ref_v = composite_background(target[idx:idx + 1], bg_tensor)
 
-                # [重要] 转为 sRGB
-                opt_v_srgb = util.rgb_to_srgb(opt_v)
-                ref_v_srgb = util.rgb_to_srgb(ref_v)
+                # 动态决定背景内容
+                if FLAGS.render_env_bg and FLAGS.envmap:
+                    # 使用当前视角的参数渲染环境背景
+                    view_id = idxs[idx]  # 获取当前样本对应的全局视角ID
+                    view_data = views[view_id]
+                    bg_img = render_env_background(lgt, curr_res, view_data['mv'], view_data['fovy'])
+                else:
+                    # 使用纯色背景
+                    bg_img = bg_tensor.view(1, 1, 1, 3)
+
+                # 合成
+                vis_opt = composite_background(opt_v, bg_img)
+                vis_ref = composite_background(ref_v, bg_img)
+
+                # 转为 sRGB
+                opt_v_srgb = util.rgb_to_srgb(vis_opt)
+                ref_v_srgb = util.rgb_to_srgb(vis_ref)
 
                 mask_v = target[idx:idx + 1, ..., 3:4]
                 # 热力图使用 Linear 空间数据计算
@@ -480,7 +615,7 @@ def main():
     with torch.no_grad():
         for i, view in enumerate(views):
             buffers = render.render_mesh(glctx, final_mesh, view['mvp'], view['campos'], lgt, FLAGS.train_res,
-                                         spp=FLAGS.spp, msaa=True, bsdf='kd')
+                                         spp=FLAGS.spp, msaa=True, bsdf=target_bsdf)
             opt_rgb = torch.clamp(buffers['shaded'][..., 0:3], 0.0, 1.0)
             ref_rgb = torch.clamp(target_images[i][..., 0:3], 0.0, 1.0)
             mask = target_images[i][..., 3:4] > 0.0
@@ -507,8 +642,15 @@ def main():
         opt_img = buffers['shaded'][0:1]  # 复用上面循环最后一次渲染结果 (正好是最后一张)
         ref_img = target_images[last_idx]  # 已经是 4D
 
-        vis_opt = composite_background(opt_img, bg_tensor)
-        vis_ref = composite_background(ref_img, bg_tensor)
+        # 最终导出也支持环境背景
+        if FLAGS.render_env_bg and FLAGS.envmap:
+            view_data = views[last_idx]
+            bg_img = render_env_background(lgt, FLAGS.train_res, view_data['mv'], view_data['fovy'])
+        else:
+            bg_img = bg_tensor.view(1, 1, 1, 3)
+
+        vis_opt = composite_background(opt_img, bg_img)
+        vis_ref = composite_background(ref_img, bg_img)
 
         # 转 sRGB
         vis_opt_srgb = util.rgb_to_srgb(vis_opt)

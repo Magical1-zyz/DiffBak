@@ -9,24 +9,36 @@ from .dataset import Dataset
 
 class DatasetMesh(Dataset):
     def __init__(self, ref_mesh, base_mesh=None, glctx=None, cam_radius=3.0, FLAGS=None, validate=False):
-        # ... (保留原有的初始化代码) ...
-        self.ref_mesh = mesh_mod.compute_tangents(ref_mesh)
-        self.base_mesh = mesh_mod.compute_tangents(base_mesh) if base_mesh is not None else self.ref_mesh
-        self.glctx = glctx
         self.FLAGS = FLAGS
         self.validate = validate
+        self.glctx = glctx
         self.aspect = FLAGS.train_res[1] / FLAGS.train_res[0]
 
-        # 统一处理 mesh 列表
+        # 1. 处理模型
+        self.ref_mesh = mesh_mod.compute_tangents(ref_mesh)
+        if base_mesh is not None:
+            # 如果没有法线，计算一下
+            if base_mesh.v_nrm is None:
+                self.base_mesh = mesh_mod.auto_normals(base_mesh)
+            else:
+                self.base_mesh = base_mesh
+            # 始终确保有切线
+            if self.base_mesh.v_tng is None:
+                self.base_mesh = mesh_mod.compute_tangents(self.base_mesh)
+        else:
+            self.base_mesh = self.ref_mesh
+
         if isinstance(ref_mesh, list):
             self.ref_meshes = ref_mesh
         else:
             self.ref_meshes = [self.ref_mesh]
 
-        # 加载环境光
+        # 2. 加载环境光
         self.envlight = light.load_env(FLAGS.envmap, scale=FLAGS.env_scale)
 
-        # --- 核心修改：计算包围盒中心和半径 ---
+        # 3. 计算包围盒中心和半径
+        # 3. 计算包围盒 (AABB)
+        # 我们需要保留 AABB 的 8 个顶点用于后续投影计算
         with torch.no_grad():
             vmins = []
             vmaxs = []
@@ -34,141 +46,155 @@ class DatasetMesh(Dataset):
                 vmin, vmax = mesh_mod.aabb(m)
                 vmins.append(vmin)
                 vmaxs.append(vmax)
-            vmin = torch.min(torch.stack(vmins, dim=0), dim=0).values
-            vmax = torch.max(torch.stack(vmaxs, dim=0), dim=0).values
-            self.center = ((vmin + vmax) * 0.5).detach()
-            bbox_extent = (vmax - vmin).detach()
-            # 包围球半径
+            self.aabb_min = torch.min(torch.stack(vmins, dim=0), dim=0).values
+            self.aabb_max = torch.max(torch.stack(vmaxs, dim=0), dim=0).values
+
+            self.center = ((self.aabb_min + self.aabb_max) * 0.5).detach()
+            bbox_extent = (self.aabb_max - self.aabb_min).detach()
             self.bound_radius = (torch.linalg.norm(bbox_extent) * 0.5).item()
 
-        # --- 核心修改：生成64个斐波那契半球分布的相机位姿 ---
-        self.n_views = 64  # 固定64个点位
-        self.precomputed_views = self._generate_fibonacci_views(self.n_views)
+            # 生成 AABB 的 8 个角点 (用于计算紧凑 FOV)
+            # x: min, max | y: min, max | z: min, max
+            corners = []
+            for dx in [0, 1]:
+                for dy in [0, 1]:
+                    for dz in [0, 1]:
+                        corner = torch.stack([
+                            self.aabb_min[0] if dx == 0 else self.aabb_max[0],
+                            self.aabb_min[1] if dy == 0 else self.aabb_max[1],
+                            self.aabb_min[2] if dz == 0 else self.aabb_max[2]
+                        ])
+                        corners.append(corner)
+            self.aabb_corners = torch.stack(corners).to(device='cuda')  # [8, 3]
 
-        print(f"DatasetMesh: Generated {self.n_views} optimized baking views.")
+        # 4. 生成相机视角
+        self.n_top = getattr(self.FLAGS, 'cam_views_top', 64)
+        self.n_bottom = getattr(self.FLAGS, 'cam_views_bottom', 16)
+        self.n_views = self.n_top + self.n_bottom
 
-    def _generate_fibonacci_views(self, n_points):
-        """
-        生成均匀分布在半球面的相机位姿列表
-        """
+        self.precomputed_views = self._generate_fibonacci_views(self.n_top, self.n_bottom)
+
+        print(f"DatasetMesh: Generated {self.n_views} views with Adaptive FOV.")
+
+    def _generate_fibonacci_views(self, n_top, n_bottom):
         views = []
-
-        # 黄金角度
         golden_angle = np.pi * (3 - np.sqrt(5))
 
-        # 为了更清晰的烘焙，相机需要离物体稍远一点，避免透视畸变过大
-        # 使用 FLAGS 中的 cam_radius_scale，默认建议 2.0 左右
+        # 基础距离
         radius_scale = getattr(self.FLAGS, 'cam_radius_scale', 2.0)
         dist = self.bound_radius * radius_scale
 
-        for i in range(n_points):
-            # 1. 计算斐波那契点位 (y 从 1 到 0，覆盖上半球)
-            # y 坐标分布：从顶部(1)到底部(0，即赤道)
-            y = 1 - (i / float(n_points - 1))
-            radius_at_y = np.sqrt(1 - y * y)
-            theta = golden_angle * i
+        # 动态计算 Near/Far (安全范围)
+        safe_near = max(0.01, dist - self.bound_radius * 1.5)
+        safe_far = dist + self.bound_radius * 1.5
 
-            x = np.cos(theta) * radius_at_y
-            z = np.sin(theta) * radius_at_y
-
-            # 这是一个单位球上的方向向量 (x, y, z)
-            # 注意：nvdiffrec通常假设Y轴向上。如果你的模型底面朝下，y >= 0 就是上半球。
-            # 如果模型朝向不同，可能需要交换坐标轴，例如 z >= 0
-
-            # 加入微小的随机扰动 (Jitter)，防止完全死板的网格，增加烘焙鲁棒性
+        # 辅助函数
+        def add_view(x, y, z):
+            # 1. 计算相机位置和基础矩阵
             jitter = np.random.normal(0, 0.02, 3)
             cam_dir = np.array([x, y, z]) + jitter
-            cam_dir = cam_dir / np.linalg.norm(cam_dir)  # 重新归一化
+            cam_dir = cam_dir / np.linalg.norm(cam_dir)
 
-            # 2. 计算相机位置
-            # 相机位置 = 物体中心 + 方向向量 * 距离
             campos = self.center + torch.tensor(cam_dir * dist, dtype=torch.float32, device='cuda')
-
-            # 3. 计算 LookAt 矩阵 (看向物体中心)
             up = self._robust_up(campos)
             mv = util.lookAt(campos, self.center, up)
 
-            # 4. 自适应 FOV 计算
-            # 确保物体在画面内占比合适 (fov_margin控制留白，1.1表示留10%边距)
-            fov_margin = 1.1
-            # 简单估算：tan(fov/2) = radius / dist
-            # 考虑到 margin 和 aspect ratio
-            half_fov = np.arctan((self.bound_radius * fov_margin) / dist)
-            fovy = 2 * half_fov
+            # 2. 自适应 FOV 计算
+            # 将 AABB 的 8 个角点转换到相机空间
+            # mv: [4, 4], corners: [8, 3] -> 需扩充为 [8, 4]
+            corners_homo = torch.cat([self.aabb_corners, torch.ones((8, 1), device='cuda')], dim=1)  # [8, 4]
+            corners_cam = (mv @ corners_homo.T).T  # [8, 4]
+            corners_cam = corners_cam[..., :3]  # [8, 3] (Camera Space: X right, Y up, -Z forward)
 
-            # 防止FOV过大或过小
-            fovy = float(np.clip(fovy, np.deg2rad(10.0), np.deg2rad(90.0)))
+            # 计算相机空间下的包围范围 (最大 abs X 和 abs Y)
+            # 此时物体中心大概在 (0, 0, -dist)
+            # 我们需要看物体相对于 Z轴张开了多大角度
 
-            # 构建投影矩阵
-            proj_mtx = util.perspective(fovy, self.aspect, self.FLAGS.cam_near_far[0], self.FLAGS.cam_near_far[1],
-                                        device='cuda')
+            # 简单估算：找到所有点中，|Y| / |Z| 的最大值，即为 tan(half_fov_y)
+            # 注意：Z 坐标在相机空间通常是负数，所以取 abs
+            max_tan_y = torch.max(torch.abs(corners_cam[:, 1]) / torch.abs(corners_cam[:, 2]))
+
+            # 为了保险，加上一点 margin (例如 1.1 倍，即留 10% 空隙)
+            # 允许用户通过 config 调整 margin，默认更紧凑一点 (1.05)
+            fov_margin = 1.05
+            fovy = 2.0 * float(np.arctan(max_tan_y.item() * fov_margin))
+
+            # 限制 FOV 范围，防止过大或过小
+            fovy = float(np.clip(fovy, np.deg2rad(5.0), np.deg2rad(120.0)))
+
+            # 3. 投影矩阵
+            proj_mtx = util.perspective(fovy, self.aspect, safe_near, safe_far, device='cuda')
             mvp = proj_mtx @ mv
 
             views.append({
                 'mv': mv[None, ...],
                 'mvp': mvp[None, ...],
                 'campos': campos[None, ...],
-                'fovy': fovy  # 保存FOV以备查
+                'fovy': fovy
             })
+
+        # 上半球
+        for i in range(n_top):
+            y = 1 - (i / float(n_top - 1)) if n_top > 1 else 1.0
+            radius_at_y = np.sqrt(1 - y * y)
+            theta = golden_angle * i
+            x = np.cos(theta) * radius_at_y
+            z = np.sin(theta) * radius_at_y
+            add_view(x, y, z)
+
+        # 下半球
+        for i in range(n_bottom):
+            y = - (i / float(n_bottom - 1)) if n_bottom > 1 else -1.0
+            radius_at_y = np.sqrt(1 - y * y)
+            theta = golden_angle * i
+            x = np.cos(theta) * radius_at_y
+            z = np.sin(theta) * radius_at_y
+            add_view(x, y, z)
 
         return views
 
     def _robust_up(self, eye):
-        # 计算一个稳健的 Up 向量，防止相机在头顶时翻转
         forward = (self.center - eye)
         forward = forward / torch.linalg.norm(forward)
-        # 默认 Y 轴向上
         up_y = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=self.center.device)
         up_z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.center.device)
-
-        # 如果视线与Y轴过于平行（例如在正上方），改用Z轴作为参考Up
         cross_len = torch.linalg.norm(torch.linalg.cross(up_y, forward))
-        up = up_y if cross_len > 1e-1 else up_z
-        return up
+        return up_y if cross_len > 1e-1 else up_z
 
     def __len__(self):
-        # 这里的长度决定了一个 epoch 跑多少次
-        # 如果是烘焙模式，我们希望多跑几轮优化，不仅仅是64次
-        # 所以这里的长度应该基于 FLAGS.iter
         return (self.FLAGS.iter + 1) * self.FLAGS.batch
 
     def __getitem__(self, itr):
-        # --- 核心修改：从预计算的64个视角中循环或随机采样 ---
-
-        # 方案A：如果是 Validation，按顺序展示
-        # 方案B：如果是 Training (Baking)，随机从64个最佳视角中选，确保每个batch都在优化有效区域
-
-        idx = itr % self.n_views  # 简单循环，或者用 random.randint(0, self.n_views-1)
-
-        # 为了更好的SGD优化效果，训练时建议随机打乱顺序，而不是固定循环
         if not self.validate:
             idx = np.random.randint(0, self.n_views)
+        else:
+            idx = itr % self.n_views
 
         view_data = self.precomputed_views[idx]
-
-        mv = view_data['mv']
         mvp = view_data['mvp']
         campos = view_data['campos']
+        mv = view_data['mv']
         iter_res = self.FLAGS.train_res
         iter_spp = self.FLAGS.spp
 
-        # 渲染 Reference (多材质高模)
         if len(self.ref_meshes) == 1:
             ref_out = render.render_mesh(self.glctx, self.ref_meshes[0], mvp, campos, self.envlight,
-                                         iter_res, spp=iter_spp, num_layers=self.FLAGS.layers,
+                                         iter_res, spp=iter_spp, num_layers=1,
                                          msaa=True, background=None)
         else:
             ref_out = render.render_meshes(self.glctx, self.ref_meshes, mvp, campos, self.envlight,
-                                           iter_res, spp=iter_spp, num_layers=self.FLAGS.layers,
+                                           iter_res, spp=iter_spp, num_layers=1,
                                            msaa=True, background=None)
 
-        # 注意：Baking模式下，target['img'] 应该是 Reference 渲染出的图像
         return {
             'mv': mv,
             'mvp': mvp,
             'campos': campos,
             'resolution': iter_res,
             'spp': iter_spp,
-            'img': ref_out['shaded'],  # 这是Ground Truth
+            'img': ref_out['shaded'],
             'base_mesh': self.base_mesh,
         }
+
+    def collate(self, batch):
+        return super().collate(batch)
