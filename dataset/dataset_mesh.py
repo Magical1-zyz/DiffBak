@@ -52,6 +52,7 @@ class DatasetMesh(Dataset):
             self.center = ((self.aabb_min + self.aabb_max) * 0.5).detach()
             bbox_extent = (self.aabb_max - self.aabb_min).detach()
             self.bound_radius = (torch.linalg.norm(bbox_extent) * 0.5).item()
+            self.aabb_size = bbox_extent.cpu().numpy()
 
             # 生成 AABB 的 8 个角点 (用于计算紧凑 FOV)
             # x: min, max | y: min, max | z: min, max
@@ -72,10 +73,99 @@ class DatasetMesh(Dataset):
         self.n_bottom = getattr(self.FLAGS, 'cam_views_bottom', 16)
         self.n_views = self.n_top + self.n_bottom
 
-        self.precomputed_views = self._generate_fibonacci_views(self.n_top, self.n_bottom)
+        self.precomputed_views = self._generate_scanning_views(self.n_top, self.n_bottom)
 
-        print(f"DatasetMesh: Generated {self.n_views} views with Adaptive FOV.")
+        print(f"DatasetMesh: Generated {self.n_views} views (Macro Scanning Mode).")
 
+    # 生成扫描视角 (Macro Scanning Mode)
+    def _generate_scanning_views(self, n_top, n_bottom):
+        views = []
+        golden_angle = np.pi * (3 - np.sqrt(5))
+
+        # 基础轨道半径
+        radius_scale = getattr(self.FLAGS, 'cam_radius_scale', 2.0)
+        global_dist = self.bound_radius * radius_scale
+
+        # Near/Far (由于我们会 zoom in，near 需要更近一点)
+        safe_near = max(0.01, global_dist * 0.1)
+        safe_far = global_dist * 3.0
+
+        # 定义 "视野覆盖率" (Zoom Factor)
+        # 0.5 表示每一张图只保证看清物体 50% 大小的区域，从而获得 2x 的放大倍率
+        # 对于长条物体，这会产生极好的特写效果
+        ZOOM_COVERAGE = 0.55
+
+        def add_view(x, y, z):
+            # 1. 基础相机方向 (Fibonacci Sphere)
+            cam_dir = np.array([x, y, z])
+            cam_dir = cam_dir / np.linalg.norm(cam_dir)
+
+            # 2. [关键] 计算随机 Look-At 目标点 (扫描模型)
+            # 在 AABB 内部随机取一个点，作为相机的“焦点”
+            # 范围收缩一点(0.8)，避免盯着极端的边角看
+            jitter_range = self.aabb_size * 0.4
+            random_offset = np.random.uniform(-jitter_range, jitter_range)
+
+            # 目标点 = 中心 + 随机偏移
+            target_pos_np = self.center.cpu().numpy() + random_offset
+            target_pos = torch.tensor(target_pos_np, dtype=torch.float32, device='cuda')
+
+            # 3. 计算相机位置
+            # 为了安全，相机依然在“球壳”上运动，避免穿插到模型内部
+            # 但它会旋转去盯着 target_pos 看
+            campos = self.center + torch.tensor(cam_dir * global_dist, dtype=torch.float32, device='cuda')
+
+            # 构建 LookAt 矩阵
+            up = self._robust_up(campos - target_pos)  # up 向量基于视线方向
+            mv = util.lookAt(campos, target_pos, up)
+
+            # 4. [关键] 计算微距 FOV
+            # 目标：让 target_pos 周围 radius * ZOOM_COVERAGE 大小的区域撑满屏幕
+            # 这样就实现了“放大”效果
+
+            # 计算相机到目标的实际距离
+            dist_to_target = torch.linalg.norm(campos - target_pos).item()
+
+            # 想要覆盖的局部半径
+            visible_radius = self.bound_radius * ZOOM_COVERAGE
+
+            # 简单的三角函数计算 FOV
+            fovy = 2.0 * np.arctan(visible_radius / dist_to_target)
+
+            # 限制 FOV 防止过小或过大
+            fovy = float(np.clip(fovy, np.deg2rad(15.0), np.deg2rad(100.0)))
+
+            # 投影矩阵
+            proj_mtx = util.perspective(fovy, self.aspect, safe_near, safe_far, device='cuda')
+            mvp = proj_mtx @ mv
+
+            views.append({
+                'mv': mv[None, ...],
+                'mvp': mvp[None, ...],
+                'campos': campos[None, ...],
+                'fovy': fovy
+            })
+
+        # 循环生成 (保持 Fibonacci 分布)
+        for i in range(n_top):
+            y = 1 - (i / float(n_top - 1)) if n_top > 1 else 1.0
+            radius_at_y = np.sqrt(1 - y * y)
+            theta = golden_angle * i
+            x = np.cos(theta) * radius_at_y
+            z = np.sin(theta) * radius_at_y
+            add_view(x, y, z)
+
+        for i in range(n_bottom):
+            y = - (i / float(n_bottom - 1)) if n_bottom > 1 else -1.0
+            radius_at_y = np.sqrt(1 - y * y)
+            theta = golden_angle * i
+            x = np.cos(theta) * radius_at_y
+            z = np.sin(theta) * radius_at_y
+            add_view(x, y, z)
+
+        return views
+
+    # 生成标准视角 (Standard Mode)
     def _generate_fibonacci_views(self, n_top, n_bottom):
         views = []
         golden_angle = np.pi * (3 - np.sqrt(5))
@@ -153,11 +243,15 @@ class DatasetMesh(Dataset):
 
         return views
 
-    def _robust_up(self, eye):
-        forward = (self.center - eye)
+    def _robust_up(self, forward):
+        # forward = (self.center - eye)
+        # forward 已经是 (eye - target) 或者反过来，这里我们需要它是 Z 轴方向
+        # lookAt 函数期望 up 向量。我们简单选取 Y 或 Z
         forward = forward / torch.linalg.norm(forward)
         up_y = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=self.center.device)
         up_z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.center.device)
+
+        # 如果视线太接近 Y 轴，就用 Z 轴当 Up，否则用 Y
         cross_len = torch.linalg.norm(torch.linalg.cross(up_y, forward))
         return up_y if cross_len > 1e-1 else up_z
 

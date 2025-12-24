@@ -44,23 +44,46 @@ def shade(
     # Texture lookups
     ################################################################################
     perturbed_nrm = None
+
+    # 用于计算纹理平滑度的累加变量
+    tex_diff_sum = 0.0
+
+    # 随机扰动 UV，用于计算纹理在当前像素的局部变化率 (平滑度 Loss 的核心)
+    # 稍微增加 jitter 范围，让平滑约束更强一点
+    texc_jitter = gb_texc + torch.normal(mean=0, std=0.01, size=gb_texc.shape, device="cuda")
+
     if 'kd_ks_normal' in material:
-        # Combined texture, used for MLPs because lookups are expensive
-        all_tex_jitter = material['kd_ks_normal'].sample(
-            gb_pos + torch.normal(mean=0, std=0.01, size=gb_pos.shape, device="cuda"))
+        # Combined texture (Not used in standard DiffBake path, but kept for compatibility)
+        all_tex_jitter = material['kd_ks_normal'].sample(texc_jitter)
         all_tex = material['kd_ks_normal'].sample(gb_pos)
-        assert all_tex.shape[-1] == 9 or all_tex.shape[-1] == 10, "Combined kd_ks_normal must be 9 or 10 channels"
         kd, ks, perturbed_nrm = all_tex[..., :-6], all_tex[..., -6:-3], all_tex[..., -3:]
-        # Compute albedo (kd) gradient, used for material regularizer
-        kd_grad = torch.sum(torch.abs(all_tex_jitter[..., :-6] - all_tex[..., :-6]), dim=-1, keepdim=True) / 3
+        tex_diff_sum = torch.sum(torch.abs(all_tex_jitter - all_tex), dim=-1, keepdim=True)
     else:
-        kd_jitter = material['kd'].sample(gb_texc + torch.normal(mean=0, std=0.005, size=gb_texc.shape, device="cuda"),
-                                          gb_texc_deriv)
-        kd = material['kd'].sample(gb_texc, gb_texc_deriv)
-        ks = material['ks'].sample(gb_texc, gb_texc_deriv)[..., 0:3]  # skip alpha
-        if 'normal' in material:
+        # --- 1. Kd (Albedo) ---
+        kd_val = material['kd'].sample(gb_texc, gb_texc_deriv)
+        kd_jitter = material['kd'].sample(texc_jitter, gb_texc_deriv)
+        tex_diff_sum = tex_diff_sum + torch.sum(torch.abs(kd_jitter[..., 0:3] - kd_val[..., 0:3]), dim=-1, keepdim=True)
+
+        kd = kd_val
+
+        # --- 2. Ks (ORM: Occ, Rough, Metal) ---
+        ks_val = material['ks'].sample(gb_texc, gb_texc_deriv)[..., 0:3]
+        # 如果 Ks 是可训练的（requires_grad），则加入平滑约束
+        # 通过检查是否由 Parameter 组成来判断，或者简单地总是计算（对固定值 diff 为 0，无害）
+        ks_jitter = material['ks'].sample(texc_jitter, gb_texc_deriv)[..., 0:3]
+        tex_diff_sum = tex_diff_sum + torch.sum(torch.abs(ks_jitter - ks_val), dim=-1, keepdim=True)
+
+        ks = ks_val
+
+        # --- 3. Normal Map ---
+        if 'normal' in material and material['normal'] is not None:
             perturbed_nrm = material['normal'].sample(gb_texc, gb_texc_deriv)
-        kd_grad = torch.sum(torch.abs(kd_jitter[..., 0:3] - kd[..., 0:3]), dim=-1, keepdim=True) / 3
+            nrm_jitter = material['normal'].sample(texc_jitter, gb_texc_deriv)
+            # 法线的高频噪声是视觉效果最差的，给予平滑项
+            tex_diff_sum = tex_diff_sum + torch.sum(torch.abs(nrm_jitter - perturbed_nrm), dim=-1, keepdim=True)
+
+    # 归一化平滑项
+    texture_grad = tex_diff_sum
 
     # Separate kd into alpha and color, default alpha = 1
     alpha = kd[..., 3:4] if kd.shape[-1] == 4 else torch.ones_like(kd[..., 0:1])
@@ -105,7 +128,7 @@ def shade(
     # Return multiple buffers
     buffers = {
         'shaded': torch.cat((shaded_col, alpha), dim=-1),
-        'kd_grad': torch.cat((kd_grad, alpha), dim=-1),
+        'kd_grad': torch.cat((texture_grad, alpha), dim=-1),
         'occlusion': torch.cat((ks[..., :1], alpha), dim=-1)
     }
     return buffers

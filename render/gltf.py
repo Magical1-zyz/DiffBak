@@ -85,15 +85,20 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
         num_comp = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4}.get(type_str, 1)
 
         if comp_type == 5126:
-            dtype = np.float32; comp_size = 4
+            dtype = np.float32;
+            comp_size = 4
         elif comp_type == 5123:
-            dtype = np.uint16; comp_size = 2
+            dtype = np.uint16;
+            comp_size = 2
         elif comp_type == 5125:
-            dtype = np.uint32; comp_size = 4
+            dtype = np.uint32;
+            comp_size = 4
         elif comp_type == 5121:
-            dtype = np.uint8; comp_size = 1
+            dtype = np.uint8;
+            comp_size = 1
         elif comp_type == 5122:
-            dtype = np.int16; comp_size = 2
+            dtype = np.int16;
+            comp_size = 2
         else:
             return None
 
@@ -332,7 +337,7 @@ def load_gltf(filename, mtl_override=None, merge_materials=False):
 
 
 # ==============================================================================================
-#  Save glTF Functions (保持不变)
+#  Save glTF Functions
 # ==============================================================================================
 
 @torch.no_grad()
@@ -394,19 +399,62 @@ def _save_gltf_impl(folder, mesh_obj, diffuse_only, multi):
         mesh_obj.material]
 
     for i, mat in enumerate(mats_to_export):
-        tex_name = f"mat_{i}_diffuse.png" if multi else "texture_base.png"
-        tex_path = os.path.join(folder, tex_name)
-
+        # 1. Base Color (Albeddo)  -必需
+        kd_name = f"mat_{i}_baseColor.png" if multi else "baseColor.png"
+        kd_path = os.path.join(folder, kd_name)
         kd_map = mat['kd']
-        texture.save_texture2D(tex_path, texture.rgb_to_srgb(kd_map))
+        texture.save_texture2D(kd_path, texture.rgb_to_srgb(kd_map))
 
-        images.append({"uri": tex_name})
-        textures.append({"sampler": 0, "source": i})
-        materials.append({
+        images.append({"uri": kd_name})
+        textures.append({"sampler": 0, "source": len(images)-1})
+        kd_tex_idx = len(textures) - 1
+
+        # 2. Metallic Roughness -可选
+        # 需要 Linear (不要转 sRGB)
+        mr_tex_idx = None
+        if not diffuse_only and 'ks' in mat and mat['ks'] is not None:
+            ks_name = f"mat_{i}_metallicRoughness.png" if multi else "metallicRoughness.png"
+            ks_path = os.path.join(folder, ks_name)
+            texture.save_texture2D(ks_path, mat['ks'])  # Ks 存储的是 [R=Occ, G=Rough, B=Metal]
+
+            images.append({"uri": ks_name})
+            textures.append({"sampler": 0, "source": len(images) - 1})
+            mr_tex_idx = len(textures) - 1
+
+        # 3. Normal Map - 可选
+        # 需要 Linear
+        nrm_tex_idx = None
+        if not diffuse_only and 'normal' in mat and mat['normal'] is not None:
+            nrm_name = f"mat_{i}_normal.png" if multi else "normal.png"
+            nrm_path = os.path.join(folder, nrm_name)
+            texture.save_texture2D(nrm_path, mat['normal'])
+
+            images.append({"uri": nrm_name})
+            textures.append({"sampler": 0, "source": len(images) - 1})
+            nrm_tex_idx = len(textures) - 1
+
+        # 构建 glTF 材质定义
+        pbr_def = {
+            "baseColorTexture": {"index": kd_tex_idx},
+            "metallicFactor": 1.0,  # 贴图控制，因子设为1
+            "roughnessFactor": 1.0
+        }
+
+        # 如果有 Ks 贴图，添加引用
+        if mr_tex_idx is not None:
+            pbr_def["metallicRoughnessTexture"] = {"index": mr_tex_idx}
+
+        mat_def = {
             "name": getattr(mat, 'name', f"mat_{i}"),
-            "pbrMetallicRoughness": {"baseColorTexture": {"index": i}, "metallicFactor": 0.0, "roughnessFactor": 1.0},
+            "pbrMetallicRoughness": pbr_def,
             "doubleSided": True
-        })
+        }
+
+        # 如果有 Normal 贴图，添加引用
+        if nrm_tex_idx is not None:
+            mat_def["normalTexture"] = {"index": nrm_tex_idx}
+
+        materials.append(mat_def)
 
     if multi and mesh_obj.face_material_idx is not None:
         MF = mesh_obj.face_material_idx.detach().cpu().numpy()

@@ -337,6 +337,10 @@ def main():
     parser.add_argument('--multi_materials', type=_str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--use_custom_uv', type=_str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--texture_res', nargs=2, type=int, default=[4096, 4096])
+    parser.add_argument('--use_opt_pbr', type=_str2bool, nargs='?', const=True, default=False,
+                        help='Use PBR shading for the optimized mesh (Default: Unlit/KD only)')
+    parser.add_argument('--bake_mode', type=str, default='full_pbr', choices=['color_only', 'full_pbr'],
+                        help='color_only: Optimize Kd only; full_pbr: Optimize Kd, Ks, Normal')
 
     # 训练参数
     parser.add_argument('--iter', type=int, default=3000)
@@ -362,8 +366,6 @@ def main():
     parser.add_argument('--display_interval', type=int, default=50)
     parser.add_argument('--save_interval', type=int, default=100)
     parser.add_argument('--max_display_width', type=int, default=1600)
-    parser.add_argument('--use_opt_pbr', type=_str2bool, nargs='?', const=True, default=False,
-                        help='Use PBR shading for the optimized mesh (Default: Unlit/KD only)')
 
     # 是否渲染 HDR 环境背景
     parser.add_argument('--render_env_bg', type=_str2bool, nargs='?', const=True, default=False,
@@ -382,7 +384,8 @@ def main():
     if FLAGS.ref_mesh is None: raise ValueError("Reference mesh required.")
     if FLAGS.base_mesh is None: raise ValueError("Base mesh required.")
 
-    target_bsdf = 'pbr' if FLAGS.use_opt_pbr else 'kd'
+    # 逻辑判断：如果开了 use_opt_pbr 或者 bake_mode 是 full_pbr，通常都得用 pbr shader
+    target_bsdf = 'pbr' if (FLAGS.use_opt_pbr or FLAGS.bake_mode == 'full_pbr') else 'kd'
 
     print(f"\n=== Texture Baking Config ===")
     print(f" Ref: {FLAGS.ref_mesh}")
@@ -391,6 +394,8 @@ def main():
     print(f" Loss: {FLAGS.loss_type} (Smooth: {FLAGS.smooth_weight})")
     print(f" Multi-Mat: {FLAGS.multi_materials}")
     print(f" Custom UV: {FLAGS.use_custom_uv}")
+    print(
+        f" Bake Mode: {FLAGS.bake_mode.upper()} (Optimizing: {'Kd' if FLAGS.bake_mode == 'color_only' else 'Kd, Ks, Normal'})")
     print(f" Texture Res: {FLAGS.texture_res}")
     print(f" Background: {FLAGS.background_rgb}")
     print(f" Coarse-to-Fine: {FLAGS.coarse_to_fine}")
@@ -448,7 +453,8 @@ def main():
             else:
                 out = render.render_meshes(glctx, dummy_dataset.ref_meshes, view['mvp'], view['campos'], lgt,
                                            FLAGS.train_res, spp=ref_spp, msaa=True)
-            target_images.append(out['shaded'].detach())
+            # 存到cpu
+            target_images.append(out['shaded'].detach().cpu())
             if (i + 1) % 10 == 0: print(f"      Rendered {i + 1}/{len(views)}")
 
     # 4. Setup Optimization
@@ -456,25 +462,42 @@ def main():
     geometry = DLMesh(base_mesh, FLAGS)
     train_mats, params = [], []
 
-    if FLAGS.use_opt_pbr:
-        # UE 默认: Metallic=0 (B), Roughness=0.5 (G), Specular=0.5 (Implied F0=0.04)
-        ks_val = [0.0, 0.5, 0.0]
-    else:
-        # KD 模式: 默认全哑光
-        ks_val = [0.0, 1.0, 0.0]
-
+    # 默认值
+    ks_val = [0.0, 0.5, 0.0]
     ks_init = torch.tensor(ks_val, dtype=torch.float32, device='cuda')
 
+    # 法线默认值 (Flat Normal [0.5, 0.5, 1.0])
+    normal_init = torch.tensor([0.5, 0.5, 1.0], dtype=torch.float32, device='cuda')
+
     for m_id in active_mat_ids:
+        # Kd (Base Color) 始终优化
         kd_init = torch.full((FLAGS.texture_res[0], FLAGS.texture_res[1], 3), 0.5, dtype=torch.float32, device='cuda')
+
         m = material.Material({
             'name': f'baked_mat_{m_id}',
             'bsdf': target_bsdf,
-            'kd': texture.Texture2D(kd_init),
-            'ks': texture.Texture2D(ks_init)
+            'kd': texture.Texture2D(kd_init)
         })
+        params += list(m['kd'].parameters())  # 加入优化器
+
+        # 根据 bake_mode 决定 Ks 和 Normal
+        if FLAGS.bake_mode == 'full_pbr':
+            # 创建可训练的 Texture2D
+            m['ks'] = texture.Texture2D(
+                ks_init.view(1, 1, 3).repeat(FLAGS.texture_res[0], FLAGS.texture_res[1], 1))
+            m['normal'] = texture.Texture2D(
+                normal_init.view(1, 1, 3).repeat(FLAGS.texture_res[0], FLAGS.texture_res[1], 1))
+
+            # 加入优化器
+            params += list(m['ks'].parameters())
+            params += list(m['normal'].parameters())
+        else:
+            # color_only: 使用固定值 Texture2D (不加 parameters 到 params)
+            m['ks'] = texture.Texture2D(ks_init)
+            # Normal 设为 None，渲染器会自动使用几何法线
+            m['normal'] = None
+
         train_mats.append(m)
-        params += list(m['kd'].parameters())
 
     if len(train_mats) == 1 and not FLAGS.multi_materials:
         geometry.mesh.material = train_mats[0]
@@ -485,10 +508,7 @@ def main():
     print(f"[Info] Exporting initial mesh state...")
     init_save_path = os.path.join(FLAGS.out_dir, "initial_mesh")
     os.makedirs(init_save_path, exist_ok=True)
-    if len(train_mats) > 1:
-        gltf.save_gltf_multi(init_save_path, geometry.mesh, diffuse_only=True)
-    else:
-        gltf.save_gltf(init_save_path, geometry.mesh, diffuse_only=True)
+    gltf.save_gltf(init_save_path, geometry.mesh, diffuse_only=True)  # 初始只存diffuse
 
     optimizer = torch.optim.Adam(params, lr=FLAGS.lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda x: max(0.0, 10 ** (-x * 0.0002)))
@@ -501,7 +521,8 @@ def main():
     def get_batch(n, b):
         while True:
             perm = np.random.permutation(n)
-            for i in range(0, n, b): yield perm[i:i + b]
+            for i in range(0, n, b):
+                yield perm[i:i + b]
 
     idx_gen = get_batch(len(views), FLAGS.batch)
 
@@ -521,7 +542,8 @@ def main():
 
         mvp = torch.cat([views[i]['mvp'] for i in idxs])
         campos = torch.cat([views[i]['campos'] for i in idxs])
-        target = torch.cat([target_images[i] for i in idxs])
+        # 临时搬运回 GPU
+        target = torch.cat([target_images[i].to('cuda', non_blocking=True) for i in idxs])
 
         if target.shape[1] != curr_res[0] or target.shape[2] != curr_res[1]:
             target_nchw = target.permute(0, 3, 1, 2)
@@ -540,7 +562,12 @@ def main():
         scheduler.step()
 
         with torch.no_grad():
-            for m in train_mats: m['kd'].clamp_()
+            for m in train_mats:
+                m['kd'].clamp_()
+                if FLAGS.bake_mode == 'full_pbr':
+                    m['ks'].clamp_()
+                    # normal map 不需要 clamp，因为 texture.py 里有专门的处理或者它本身是无限范围
+                    # 但为了安全通常不需要 clamp (0,1)
 
         if it % 50 == 0:
             print(
@@ -569,6 +596,10 @@ def main():
                 vis_opt = composite_background(opt_v, bg_img)
                 vis_ref = composite_background(ref_v, bg_img)
 
+                # Reinhard 色调映射，解决过曝问题
+                vis_opt = vis_opt / (1.0 + vis_opt)
+                vis_ref = vis_ref / (1.0 + vis_ref)
+
                 # 转为 sRGB
                 opt_v_srgb = util.rgb_to_srgb(vis_opt)
                 ref_v_srgb = util.rgb_to_srgb(vis_ref)
@@ -585,6 +616,12 @@ def main():
                         suffix = f"_mat{i}" if len(train_mats) > 1 else ""
                         filename = os.path.join(FLAGS.out_dir, f"progress_kd{suffix}_{it:04d}.png")
                         texture.save_texture2D(filename, texture.rgb_to_srgb(m['kd']))
+                        # 只在 full_pbr 模式下保存 ks 和 normal
+                        if FLAGS.bake_mode == 'full_pbr':
+                            texture.save_texture2D(os.path.join(FLAGS.out_dir, f"progress_ks{suffix}_{it:04d}.png"),
+                                                   m['ks'])
+                            texture.save_texture2D(os.path.join(FLAGS.out_dir, f"progress_nrm{suffix}_{it:04d}.png"),
+                                                   m['normal'])
 
                     comp_path = os.path.join(FLAGS.out_dir, f"progress_render_{it:04d}.png")
                     util.save_image(comp_path, vis[0].detach().cpu().numpy())
@@ -606,6 +643,8 @@ def main():
     total_psnr = 0.0
     count = 0
     final_mesh = geometry.getMesh(None)
+
+    # 重新组装材质给final_mesh
     if len(train_mats) == 1 and not FLAGS.multi_materials:
         final_mesh.material = train_mats[0]
         final_mesh.materials = None
@@ -617,8 +656,12 @@ def main():
             buffers = render.render_mesh(glctx, final_mesh, view['mvp'], view['campos'], lgt, FLAGS.train_res,
                                          spp=FLAGS.spp, msaa=True, bsdf=target_bsdf)
             opt_rgb = torch.clamp(buffers['shaded'][..., 0:3], 0.0, 1.0)
-            ref_rgb = torch.clamp(target_images[i][..., 0:3], 0.0, 1.0)
-            mask = target_images[i][..., 3:4] > 0.0
+
+            # 临时从CPU取回ground truth图片到GPU
+            target_gpu = target_images[i].to('cuda')
+
+            ref_rgb = torch.clamp(target_gpu[..., 0:3], 0.0, 1.0)
+            mask = target_gpu[..., 3:4] > 0.0
 
             valid = torch.sum(mask) * 3.0
             if valid < 1.0: continue
@@ -631,16 +674,21 @@ def main():
     print(f"      Final Average PSNR: {avg_psnr:.2f} dB")
 
     save_path = os.path.join(FLAGS.out_dir, "baked_mesh")
+
+    # 动态判断是否只导出 Diffuse (避免 color_only 模式下导出无用贴图)
+    is_diffuse_only = (FLAGS.bake_mode == 'color_only')
+
     if len(train_mats) > 1:
-        gltf.save_gltf_multi(save_path, final_mesh, diffuse_only=True)
+        gltf.save_gltf_multi(save_path, final_mesh, diffuse_only=is_diffuse_only)
     else:
-        gltf.save_gltf(save_path, final_mesh, diffuse_only=True)
+        gltf.save_gltf(save_path, final_mesh, diffuse_only=is_diffuse_only)
 
     with torch.no_grad():
         # 最后一张对比图
         last_idx = len(views) - 1
         opt_img = buffers['shaded'][0:1]  # 复用上面循环最后一次渲染结果 (正好是最后一张)
-        ref_img = target_images[last_idx]  # 已经是 4D
+        # 取回 GPU
+        ref_img = target_images[last_idx].to('cuda')
 
         # 最终导出也支持环境背景
         if FLAGS.render_env_bg and FLAGS.envmap:
@@ -651,6 +699,10 @@ def main():
 
         vis_opt = composite_background(opt_img, bg_img)
         vis_ref = composite_background(ref_img, bg_img)
+
+        # Reinhard 色调映射
+        vis_opt = vis_opt / (1.0 + vis_opt)
+        vis_ref = vis_ref / (1.0 + vis_ref)
 
         # 转 sRGB
         vis_opt_srgb = util.rgb_to_srgb(vis_opt)

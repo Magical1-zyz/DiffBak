@@ -8,7 +8,6 @@
 # its affiliates is strictly prohibited.
 
 from .ops import xfm_points, xfm_vectors, image_loss, diffuse_cubemap, specular_cubemap, prepare_shading_normal, lambert, frostbite_diffuse, pbr_specular, pbr_bsdf, _fresnel_shlick, _ndf_ggx, _lambda_ggx, _masking_smith
-# 修改这里：引用新的 BakingLoss，删除 ssim_loss 等
 from .loss import BakingLoss, log_l1_loss, l1_loss, mse_loss, smoothness_loss
 
 __all__ = [
